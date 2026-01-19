@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # envoy-custom - SSH proxy with Pomerium integration
   envoy-custom:
@@ -8,7 +6,7 @@ services:
       dockerfile: docker/Dockerfile
     volumes:
       - ./configs/envoy.yaml:/etc/envoy/envoy.yaml:ro
-      - keys:/etc/envoy/keys
+      - ./keys:/etc/envoy/keys
     ports:
       - "2222:2222"    # SSH proxy
       - "9901:9901"    # Envoy admin
@@ -23,6 +21,8 @@ services:
     image: pomerium/pomerium:latest
     volumes:
       - ./configs/pomerium-config.yaml:/pomerium/config.yaml:ro
+      - ./configs/cert.pem:/pomerium/cert.pem:ro
+      - ./configs/key.pem:/pomerium/key.pem:ro
     ports:
       - "443:443"      # HTTPS proxy
       - "5443:5443"    # gRPC (StreamManagement for envoy-custom)
@@ -73,9 +73,4 @@ networks:
 
 volumes:
   ssh-config:
-  keys:
-    driver: local
-    driver_opts:
-      type: none
-      device: ${PWD}/keys
-      o: "uid=0,gid=0"
+
