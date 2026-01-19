@@ -1,0 +1,71 @@
+# Pomerium Configuration for Docker Demo
+# This configuration works with envoy-custom's SSH filter
+
+# Core settings
+address: ":443"
+grpc_address: ":5443"
+grpc_insecure: true
+
+# Generate these secrets with: head -c32 /dev/urandom | base64
+# IMPORTANT: Replace these with your own generated secrets for any non-demo use
+shared_secret: "Vy1vHfGdOJ5fSLR3YN2nk7pKxNxOY3pQhPOoM3OeT/c="
+cookie_secret: "WwbYQYDwP+oI5oNVVMW4eOZbqVPLKt3cWL1qhP3nNWU="
+
+# Identity provider configuration
+# Using Pomerium's hosted IdP for demo (no external IdP needed)
+# For production, configure Google, Okta, Azure AD, etc.
+idp_provider: "google"
+idp_client_id: "hoxnox@gmail.com"
+# pupupu...
+idp_client_secret: "YOUR_GOOGLE_CLIENT_SECRET"
+
+# Alternatively, use mock auth for local testing (uncomment below):
+# idp_provider: "oidc"
+# idp_provider_url: "https://mockidp.example.com"
+
+# Autocert for automatic TLS certificates (uses Let's Encrypt staging for demo)
+# autocert: true
+# autocert_use_staging: true
+
+# For local demo without real certs, generate self-signed:
+# openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
+certificate_file: "/pomerium/cert.pem"
+certificate_key_file: "/pomerium/key.pem"
+
+# Logging
+log_level: "debug"
+
+# Routes
+routes:
+  # HTTP service - httpbin
+  - from: https://httpbin.localhost.pomerium.io
+    to: http://httpbin.org:80/ip
+    policy:
+      - allow:
+          or:
+            - email:
+                is: "user@example.com"
+            - domain:
+                is: "example.com"
+    preserve_host_header: true
+
+  # Verify service - useful for testing auth
+  - from: https://verify.localhost.pomerium.io
+    to: http://verify:8000
+    policy:
+      - allow:
+          or:
+            - email:
+                is: "user@example.com"
+            - domain:
+                is: "example.com"
+
+  # SSH route (TCP passthrough) - this route is for reference
+  # The actual SSH proxying is handled by envoy-custom directly
+  # - from: tcp+https://ssh.localhost.pomerium.io:22
+  #   to: tcp://openssh-server:2222
+  #   policy:
+  #     - allow:
+  #         or:
+  #           - email:
+  #               is: "user@example.com"

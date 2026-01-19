@@ -1,0 +1,81 @@
+version: '3.8'
+
+services:
+  # envoy-custom - SSH proxy with Pomerium integration
+  envoy-custom:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    volumes:
+      - ./configs/envoy.yaml:/etc/envoy/envoy.yaml:ro
+      - keys:/etc/envoy/keys
+    ports:
+      - "2222:2222"    # SSH proxy
+      - "9901:9901"    # Envoy admin
+    networks:
+      - pomerium-net
+    depends_on:
+      - pomerium
+    restart: unless-stopped
+
+  # Pomerium - authentication and authorization
+  pomerium:
+    image: pomerium/pomerium:latest
+    volumes:
+      - ./configs/pomerium-config.yaml:/pomerium/config.yaml:ro
+    ports:
+      - "443:443"      # HTTPS proxy
+      - "5443:5443"    # gRPC (StreamManagement for envoy-custom)
+    environment:
+      - POMERIUM_DEBUG=true
+    networks:
+      - pomerium-net
+    depends_on:
+      - httpbin
+      - openssh-server
+    restart: unless-stopped
+
+  # OpenSSH server - upstream SSH target
+  openssh-server:
+    image: linuxserver/openssh-server:latest
+    hostname: ssh-backend
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=UTC
+      - PASSWORD_ACCESS=true
+      - USER_PASSWORD=demo
+      - USER_NAME=demo
+      - SUDO_ACCESS=true
+    volumes:
+      - ssh-config:/config
+    networks:
+      - pomerium-net
+    restart: unless-stopped
+
+  # httpbin - sample HTTP service
+  httpbin:
+    image: kennethreitz/httpbin:latest
+    networks:
+      - pomerium-net
+    restart: unless-stopped
+
+  # Pomerium verify service - useful for testing auth
+  verify:
+    image: pomerium/verify:latest
+    networks:
+      - pomerium-net
+    restart: unless-stopped
+
+networks:
+  pomerium-net:
+    driver: bridge
+
+volumes:
+  ssh-config:
+  keys:
+    driver: local
+    driver_opts:
+      type: none
+      device: ${PWD}/keys
+      o: "uid=0,gid=0"
