@@ -27,7 +27,7 @@ load("@hedron_compile_commands//:workspace_setup_transitive_transitive_transitiv
 
 hedron_compile_commands_setup_transitive_transitive_transitive()
 
-envoy_version = "bad8280de85c25b147a90c1d9b8a8c67a13e7134"
+envoy_version = "2fdc50edf463bd125b412409b3f52b78fed60cf6"
 
 openssh_version = "V_10_2_P1"
 
@@ -54,11 +54,13 @@ http_archive(
         "//patches/envoy:0005-suppress-duplicate-wip-warnings.patch",
         "//patches/envoy:0006-coverage-format.patch",
         "//patches/envoy:0007-user-space-io-handle.patch",
-        "//patches/envoy:0008-cel-cpp-compatibility.patch",
-        "//patches/envoy:tmp-envoy-41815.patch",
+        "//patches/envoy:0008-quic-client-authentication.patch",
+        "//patches/envoy:0009-connect-udp-packet-semantics.patch",
+        "//patches/envoy:0010-quic-p384-server-certificates.patch",
+        "//patches/envoy:0011-websocket-extended-connect-upgrade.patch",
         "//patches/envoy:tmp-transport-socket-options.patch",
     ],
-    sha256 = "acaf4d3be97d4758539ff9f87c5344eab801337d246d5995f10c3af6f7a6c588",
+    sha256 = "e7a78d888a8ce8a380a7608bfe3f805b49de74421ba062e44d22e38f1cffc24b",
     strip_prefix = "envoy-" + envoy_version,
     url = "https://github.com/envoyproxy/envoy/archive/" + envoy_version + ".zip",
 )
@@ -78,6 +80,10 @@ envoy_repo()
 load("@envoy//bazel:repositories.bzl", "envoy_dependencies")
 
 envoy_dependencies()
+
+load("@envoy//bazel:bazel_deps.bzl", "envoy_bazel_dependencies")
+
+envoy_bazel_dependencies()
 
 load("@envoy//bazel:repositories_extra.bzl", "envoy_dependencies_extra")
 

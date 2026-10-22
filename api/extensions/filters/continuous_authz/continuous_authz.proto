@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package openzta.extensions.filters.continuous_authz.v1;
+
+import "envoy/extensions/filters/http/ext_authz/v3/ext_authz.proto";
+import "envoy/extensions/filters/network/ext_authz/v3/ext_authz.proto";
+import "google/protobuf/duration.proto";
+import "validate/validate.proto";
+
+option go_package = "github.com/pomerium/envoy-custom/api/extensions/filters/continuous_authz";
+
+// Rechecks use the original authenticated identity and resource. No request or
+// response body is buffered or replayed. Unavailability fails closed.
+message Recheck {
+  // Default 15s. Zero/negative intervals are rejected, never silently disabled.
+  google.protobuf.Duration interval = 1 [(validate.rules).duration = {gt: {}}];
+  // Positive jitter added to each interval, default 1s. Explicit zero disables jitter.
+  google.protobuf.Duration jitter = 2 [(validate.rules).duration = {gte: {}}];
+  // Default 24h. Explicit zero permits an unlimited session lifetime.
+  google.protobuf.Duration max_session_duration = 3 [(validate.rules).duration = {gte: {}}];
+}
+
+message HttpContinuousAuthz {
+  envoy.extensions.filters.http.ext_authz.v3.ExtAuthz authorization = 1
+      [(validate.rules).message.required = true];
+  Recheck recheck = 2;
+  // NAC resource identifier bound to this gateway. Never derived from client Host.
+  // A route may explicitly override it through trusted filter metadata under
+  // openzta.continuous_authz.resource_host when serving multiple resources.
+  string resource_host = 3 [(validate.rules).string = {min_len: 1, max_len: 253}];
+}
+
+message NetworkContinuousAuthz {
+  envoy.extensions.filters.network.ext_authz.v3.ExtAuthz authorization = 1
+      [(validate.rules).message.required = true];
+  Recheck recheck = 2;
+}

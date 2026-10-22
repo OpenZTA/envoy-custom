@@ -28,3 +28,24 @@ build --cxxopt=-std=c++23 --host_cxxopt=-std=c++23
 build:linux --copt="-Wno-error=unused-command-line-argument"
 # The quiche library is partially annotated for nullability.
 build --copt="-Wno-nullability-completeness"
+
+# Container production profile. Keep this independent of the upstream
+# compile-time-options test matrix (which forces the optional FIPS toolchain).
+build:openzta --define=admin_html=disabled
+build:openzta --define=signal_trace=disabled
+build:openzta --define=hot_restart=disabled
+build:openzta --define=google_grpc=disabled
+build:openzta --define=boringssl=default
+build:openzta --define=path_normalization_by_default=true
+build:openzta --define=deprecated_features=disabled
+build:openzta --define=tcmalloc=gperftools
+# The static ARM64 executable allocates before glibc finishes initialization.
+# libgcc unwinding aborts there; all production code retains frame pointers.
+# Prefer gperftools' supported frame-pointer unwinder in the allocator itself.
+build:openzta --per_file_copt=(^|/)gperftools/src/stacktrace[.]cc@-DTCMALLOC_DONT_PREFER_LIBUNWIND=1
+build:openzta --define=zlib=ng
+build:openzta --define=uhv=enabled
+build:openzta --@envoy//bazel:http3=True
+# Avoid optimizing the generated GMock machinery in test-only translation units.
+# Production libraries and the gateway binary retain the selected opt profile.
+build:openzta --per_file_copt=(^|/)test/.*[.]cc@-O0,-gline-tables-only

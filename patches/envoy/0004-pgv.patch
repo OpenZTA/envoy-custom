@@ -1,11 +1,6 @@
-diff --git a/api/bazel/pgv.patch b/api/bazel/pgv.patch
-index bafc642fb0..e917169941 100644
---- a/api/bazel/pgv.patch
-+++ b/api/bazel/pgv.patch
-@@ -28,3 +28,16 @@ index a9d38c5..2baa5d2 100644
-  
-  package(
-      default_visibility =
+--- /dev/null
++++ b/api/bazel/pgv_openzta.patch
+@@ -0,0 +1,13 @@
 +diff --git a/validate/validate.h b/validate/validate.h
 +index d6cf6c9..a017406 100644
 +--- a/validate/validate.h
@@ -19,3 +14,14 @@ index bafc642fb0..e917169941 100644
 +     str_char += char_len;
 +     byte_len -= char_len;
 +     ++unicode_len;
+--- a/api/bazel/repositories.bzl
++++ b/api/bazel/repositories.bzl
+@@ -37,6 +37,8 @@
+     )
+     external_http_archive(
+         name = "com_envoyproxy_protoc_gen_validate",
++        patches = ["@envoy_api//bazel:pgv_openzta.patch"],
++        patch_args = ["-p1"],
+     )
+     external_http_archive(
+         name = "com_google_googleapis",

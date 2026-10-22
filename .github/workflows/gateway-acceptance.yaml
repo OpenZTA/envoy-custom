@@ -1,0 +1,26 @@
+name: Gateway acceptance
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  native-gateway:
+    runs-on: ${{ vars.ENVOY_BUILD_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 360
+    env:
+      BUILD_JOBS: ${{ vars.ENVOY_BUILD_JOBS || '3' }}
+      TEST_JOBS: ${{ vars.ENVOY_TEST_JOBS || '1' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build production binary and all fork C++ tests
+        run: docker build --build-arg BUILD_JOBS="$BUILD_JOBS" --build-arg TEST_JOBS="$TEST_JOBS" --build-arg BUILD_SCM_REVISION="$GITHUB_SHA" -f docker/Dockerfile -t openzta-envoy:acceptance .
+      - name: Exercise real HTTP, streaming, gRPC and TCP transports
+        working-directory: test/acceptance
+        env:
+          OPENZTA_ENVOY_IMAGE: openzta-envoy:acceptance
+          GOTOOLCHAIN: go1.26.10
+        run: go test -race -count=1 -timeout=5m -v ./...

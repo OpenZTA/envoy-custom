@@ -1,0 +1,292 @@
+--- a/source/extensions/upstreams/http/udp/upstream_request.h
++++ b/source/extensions/upstreams/http/udp/upstream_request.h
+@@ -72,7 +72,7 @@
+   void encodeMetadata(const Envoy::Http::MetadataMapVector&) override {}
+   Envoy::Http::Status encodeHeaders(const Envoy::Http::RequestHeaderMap&, bool end_stream) override;
+   void encodeTrailers(const Envoy::Http::RequestTrailerMap&) override {}
+-  void readDisable(bool) override {}
++  void readDisable(bool disable) override;
+   void resetStream() override;
+   void enableTcpTunneling() override {}
+   void setAccount(Buffer::BufferMemoryAccountSharedPtr) override {}
+@@ -84,7 +84,7 @@
+                      Network::Address::InstanceConstSharedPtr peer_address,
+                      Buffer::InstancePtr buffer, MonotonicTime receive_time, uint8_t tos,
+                      Buffer::OwnedImpl saved_cmsg) override;
+-  uint64_t maxDatagramSize() const override { return Network::DEFAULT_UDP_MAX_DATAGRAM_SIZE; }
++  uint64_t maxDatagramSize() const override { return 65535; }
+   void onDatagramsDropped(uint32_t dropped) override {
+     // TODO(https://github.com/envoyproxy/envoy/issues/23564): Add statistics for CONNECT-UDP
+     // upstreams.
+@@ -115,6 +115,7 @@
+   quiche::CapsuleParser capsule_parser_{this};
+   quiche::SimpleBufferAllocator capsule_buffer_allocator_;
+   uint32_t datagrams_dropped_ = 0;
++  uint32_t read_disable_count_ = 0;
+ };
+ 
+ } // namespace Udp
+--- a/source/extensions/upstreams/http/udp/upstream_request.cc
++++ b/source/extensions/upstreams/http/udp/upstream_request.cc
+@@ -11,6 +11,7 @@
+ #include "source/common/http/codes.h"
+ #include "source/common/http/header_map_impl.h"
+ #include "source/common/http/headers.h"
++#include "source/common/http/header_utility.h"
+ #include "source/common/http/message_impl.h"
+ #include "source/common/network/transport_socket_options_impl.h"
+ #include "source/common/router/router.h"
+@@ -72,11 +73,33 @@
+       Event::PlatformDefaultTriggerType, Event::FileReadyType::Read);
+ }
+ 
++// Apply downstream HTTP flow control to the UDP socket. The kernel's bounded
++// datagram queue may drop packets while paused; userspace must not grow without
++// bound when an HTTP client stops consuming the encapsulated response.
++void UdpUpstream::readDisable(bool disable) {
++  if (!socket_->isOpen()) {
++    return;
++  }
++  if (disable) {
++    ++read_disable_count_;
++  } else if (read_disable_count_ > 0) {
++    --read_disable_count_;
++  } else {
++    return;
++  }
++  const uint32_t events = read_disable_count_ == 0
++      ? static_cast<uint32_t>(Event::FileReadyType::Read) : 0;
++  socket_->ioHandle().enableFileEvents(events);
++  if (read_disable_count_ == 0) {
++    socket_->ioHandle().activateFileEvents(Event::FileReadyType::Read);
++  }
++}
++
+ void UdpUpstream::encodeData(Buffer::Instance& data, bool end_stream) {
+   for (const Buffer::RawSlice& slice : data.getRawSlices()) {
+     absl::string_view mem_slice(static_cast<const char*>(slice.mem_), slice.len_);
+     if (!capsule_parser_.IngestCapsuleFragment(mem_slice)) {
+-      ENVOY_LOG_MISC(error, "Capsule ingestion error occured: slice = {}", mem_slice);
++      ENVOY_LOG_MISC(error, "UDP capsule ingestion failed: slice length = {}", mem_slice.size());
+       break;
+     }
+   }
+@@ -85,13 +108,21 @@
+   }
+ }
+ 
+-Envoy::Http::Status UdpUpstream::encodeHeaders(const Envoy::Http::RequestHeaderMap& /*headers*/,
++Envoy::Http::Status UdpUpstream::encodeHeaders(const Envoy::Http::RequestHeaderMap& headers,
+                                                bool end_stream) {
+   // For successful CONNECT-UDP handshakes, synthesizes the 200 response headers downstream.
+   Envoy::Http::ResponseHeaderMapPtr response_headers{
+       Envoy::Http::createHeaderMap<Envoy::Http::ResponseHeaderMapImpl>(
+           {{Envoy::Http::Headers::get().Status, "200"},
+            {Envoy::Http::Headers::get().CapsuleProtocol, "?1"}})};
++  // UHV represents extended CONNECT as an HTTP/1 upgrade internally. Supply
++  // the matching switching-protocol response; H2/H3 validators map it to 200.
++  // HTTP/1 clients also need 101 before the codec switches to capsule bytes.
++  if (Envoy::Http::HeaderUtility::isConnectUdpRequest(headers)) {
++    response_headers->setStatus("101");
++    response_headers->setUpgrade("connect-udp");
++    response_headers->setConnection("upgrade");
++  }
+   if (end_stream) {
+     // If the request header is the end of the stream, responds with 400 Bad Request. Does not
+     // return an error code to avoid replying with 503 Service Unavailable.
+@@ -115,11 +146,14 @@
+ }
+ 
+ void UdpUpstream::onSocketReadReady() {
++  if (!socket_->isOpen() || read_disable_count_ != 0) {
++    return;
++  }
+   uint32_t packets_dropped = 0;
+   const Api::IoErrorPtr result = Network::Utility::readPacketsFromSocket(
+       socket_->ioHandle(), *socket_->connectionInfoProvider().localAddress(), *this,
+       dispatcher_.timeSource(), /*allow_gro=*/true, /*allow_mmsg=*/true, packets_dropped);
+-  if (result == nullptr) {
++  if (result == nullptr && read_disable_count_ == 0 && socket_->isOpen()) {
+     socket_->ioHandle().activateFileEvents(Event::FileReadyType::Read);
+     return;
+   }
+@@ -131,6 +165,9 @@
+                                 Network::Address::InstanceConstSharedPtr /*peer_address*/,
+                                 Buffer::InstancePtr buffer, MonotonicTime /*receive_time*/,
+                                 uint8_t /*tos*/, Buffer::OwnedImpl /*saved_cmsg*/) {
++  if (upstream_to_downstream_ == nullptr || !socket_->isOpen()) {
++    return;
++  }
+   std::string data = buffer->toString();
+   quiche::ConnectUdpDatagramUdpPacketPayload payload(data);
+   quiche::QuicheBuffer serialized_capsule =
+@@ -162,18 +199,29 @@
+     return true;
+   }
+ 
++  // Use the portable IPv4 UDP payload limit; reject a bad packet rather than
++  // silently passing an impossible length to the kernel.
++  if (connect_udp_datagram_payload->GetUdpProxyingPayload().size() > 65507) {
++    return false;
++  }
+   Buffer::InstancePtr buffer = std::make_unique<Buffer::OwnedImpl>();
+   buffer->add(connect_udp_datagram_payload->GetUdpProxyingPayload());
+   bytes_meter_->addWireBytesSent(buffer->length());
+-  Api::IoCallUint64Result rc = Network::Utility::writeToSocket(
+-      socket_->ioHandle(), *buffer, /*local_ip=*/nullptr, *host_->address());
++  // Stream writev deliberately skips empty buffers. A zero-length UDP packet
++  // is a real packet, so send it with sendmsg instead.
++  Api::IoCallUint64Result rc = buffer->length() == 0
++      ? socket_->ioHandle().sendmsg(nullptr, 0, 0, nullptr, *host_->address())
++      : Network::Utility::writeToSocket(
++            socket_->ioHandle(), *buffer, /*local_ip=*/nullptr, *host_->address());
+   // TODO(https://github.com/envoyproxy/envoy/issues/23564): Handle some socket errors here.
+   return true;
+ }
+ 
+ void UdpUpstream::OnCapsuleParseFailure(absl::string_view error_message) {
+-  upstream_to_downstream_->onResetStream(Envoy::Http::StreamResetReason::ProtocolError,
++  if (upstream_to_downstream_ != nullptr) {
++    upstream_to_downstream_->onResetStream(Envoy::Http::StreamResetReason::ProtocolError,
+                                          error_message);
++  }
+ }
+ 
+ } // namespace Udp
+--- a/source/common/network/io_socket_handle_impl.cc
++++ b/source/common/network/io_socket_handle_impl.cc
+@@ -165,9 +165,8 @@
+       num_slices_to_write++;
+     }
+   }
+-  if (num_slices_to_write == 0) {
+-    return Api::ioCallUint64ResultNoError();
+-  }
++  // sendmsg is the datagram API: an empty payload still sends one UDP packet.
++  // Keep writev's empty-stream-write optimization separate.
+ 
+   msghdr message;
+   message.msg_name = reinterpret_cast<void*>(sock_addr);
+--- a/source/extensions/upstreams/http/udp/BUILD
++++ b/source/extensions/upstreams/http/udp/BUILD
+@@ -43,6 +43,7 @@
+         "//source/common/http:codes_lib",
+         "//source/common/http:header_map_lib",
+         "//source/common/http:headers_lib",
++        "//source/common/http:header_utility_lib",
+         "//source/common/http:message_lib",
+         "//source/common/network:application_protocol_lib",
+         "//source/common/network:transport_socket_options_lib",
+--- a/source/common/quic/http_datagram_handler.cc
++++ b/source/common/quic/http_datagram_handler.cc
+@@ -1,13 +1,17 @@
+ #include "source/common/quic/http_datagram_handler.h"
+ 
+ #include "source/common/buffer/buffer_impl.h"
++#include "envoy/stream_info/stream_info.h"
+ #include "source/common/common/logger.h"
+ #include "source/common/http/header_map_impl.h"
+ 
+ #include "absl/strings/string_view.h"
+ #include "quiche/common/capsule.h"
+ #include "quiche/common/quiche_buffer_allocator.h"
++#include "quiche/common/quiche_mem_slice.h"
++#include "quiche/quic/core/quic_data_writer.h"
+ #include "quiche/quic/core/http/quic_spdy_stream.h"
++#include "quiche/quic/core/http/quic_spdy_session.h"
+ #include "quiche/quic/core/quic_types.h"
+ 
+ namespace Envoy {
+@@ -31,6 +35,20 @@
+ 
+ void HttpDatagramHandler::OnHttp3Datagram(quic::QuicStreamId stream_id, absl::string_view payload) {
+   ASSERT(stream_id == stream_.id());
++  if (stream_decoder_provider_) {
++    auto* request_decoder = dynamic_cast<Http::RequestDecoder*>(stream_decoder_provider_());
++    if (request_decoder != nullptr) {
++      const auto& namespaces = request_decoder->streamInfo().dynamicMetadata().filter_metadata();
++      const auto ns = namespaces.find("openzta.continuous_authz");
++      if (ns == namespaces.end()) {
++        return;
++      }
++      const auto authorized = ns->second.fields().find("initial_authorized");
++      if (authorized == ns->second.fields().end() || !authorized->second.bool_value()) {
++        return;
++      }
++    }
++  }
+   ENVOY_LOG(debug, "received a HTTP/3 Datagram with stream id={}", stream_id);
+   decodeCapsule(quiche::Capsule::Datagram(payload));
+ }
+@@ -49,22 +67,40 @@
+     stream_.WriteCapsule(capsule, fin_set_);
+     return true;
+   }
+-  quic::DatagramStatus status =
+-      stream_.SendHttp3Datagram(capsule.datagram_capsule().http_datagram_payload);
++  // Larger packets and peers without DATAGRAM use flow-controlled capsules,
++  // which also lets UDP readDisable() propagate HTTP write backpressure.
++  if (!stream_.spdy_session()->SupportsH3Datagram() ||
++      capsule.datagram_capsule().http_datagram_payload.size() > stream_.GetMaxDatagramSize()) {
++    stream_.WriteCapsule(capsule, fin_set_);
++    return true;
++  }
++  // Write the RFC 9297 quarter-stream-ID prefix, then use QUIC's public
++  // immediate-send API. Avoid its unbounded default datagram queue entirely;
++  // congestion and socket backpressure fall back to the HTTP stream below.
++  const auto payload = capsule.datagram_capsule().http_datagram_payload;
++  const uint64_t quarter_stream_id = stream_.id() / 4;
++  const size_t length = quic::QuicDataWriter::GetVarInt62Len(quarter_stream_id) + payload.size();
++  quiche::QuicheBuffer buffer(&capsule_buffer_allocator_, length);
++  quic::QuicDataWriter writer(length, buffer.data());
++  if (!writer.WriteVarInt62(quarter_stream_id) || !writer.WriteBytes(payload.data(), payload.size())) {
++    return false;
++  }
++  const quic::DatagramStatus status =
++      stream_.spdy_session()->SendDatagram(quiche::QuicheMemSlice(std::move(buffer))).status;
+   if (status == quic::DatagramStatus::DATAGRAM_STATUS_SUCCESS) {
+     return true;
+   }
+-  // When SendHttp3Datagram cannot send a datagram immediately, it puts it into the queue and
+-  // returns DATAGRAM_STATUS_BLOCKED.
+   if (status == quic::DatagramStatus::DATAGRAM_STATUS_BLOCKED) {
+-    ENVOY_LOG(trace, fmt::format("SendHttpH3Datagram failed: status = {}, buffers the Datagram.",
+-                                 quic::DatagramStatusToString(status)));
++    stream_.WriteCapsule(capsule, fin_set_);
+     return true;
+   }
+   if (status == quic::DatagramStatus::DATAGRAM_STATUS_TOO_LARGE ||
+-      status == quic::DatagramStatus::DATAGRAM_STATUS_SETTINGS_NOT_RECEIVED) {
+-    ENVOY_LOG(warn, fmt::format("SendHttpH3Datagram failed: status = {}, drops the Datagram.",
+-                                quic::DatagramStatusToString(status)));
++      status == quic::DatagramStatus::DATAGRAM_STATUS_SETTINGS_NOT_RECEIVED ||
++      status == quic::DatagramStatus::DATAGRAM_STATUS_UNSUPPORTED) {
++    // RFC 9297 capsule fallback is needed both for peers without HTTP Datagrams
++    // and for a UDP packet larger than the path's QUIC Datagram payload. Preserve
++    // the whole packet instead of silently dropping it or resetting the tunnel.
++    stream_.WriteCapsule(capsule, fin_set_);
+     return true;
+   }
+   // Otherwise, returns false and thus resets the corresponding stream.
+--- a/source/common/quic/envoy_quic_server_stream.cc
++++ b/source/common/quic/envoy_quic_server_stream.cc
+@@ -218,14 +218,12 @@
+ #endif
+ 
+ #ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
+-  if (Http::HeaderUtility::isCapsuleProtocol(*headers) ||
+-      Http::HeaderUtility::isConnectUdpRequest(*headers)) {
++  // This protected profile exposes HTTP Datagrams only for CONNECT-UDP.
++  // A Capsule-Protocol header on an ordinary HTTP application request must not
++  // bypass HTTP stream flow control or inject datagrams into its request body.
++  if (Http::HeaderUtility::isConnectUdpRequest(*headers) ||
++      headers->getProtocolValue() == "connect-udp") {
+     useCapsuleProtocol();
+-    // HTTP/3 Datagrams sent over CONNECT-UDP are already congestion controlled, so make it bypass
+-    // the default Datagram queue.
+-    if (Http::HeaderUtility::isConnectUdpRequest(*headers)) {
+-      session()->SetForceFlushForDefaultQueue(true);
+-    }
+   }
+ #endif
+ 

@@ -1,0 +1,49 @@
+--- a/source/common/quic/envoy_quic_utils.cc
++++ b/source/common/quic/envoy_quic_utils.cc
+@@ -341,17 +341,17 @@
+   const int pkey_id = EVP_PKEY_id(public_key);
+   switch (pkey_id) {
+   case EVP_PKEY_EC: {
+-    // We only support P-256 ECDSA today.
+     const EC_KEY* ecdsa_public_key = EVP_PKEY_get0_EC_KEY(public_key);
+-    // Since we checked the key type above, this should be valid.
+     ASSERT(ecdsa_public_key != nullptr);
+     const EC_GROUP* ecdsa_group = EC_KEY_get0_group(ecdsa_public_key);
+-    if (ecdsa_group == nullptr || EC_GROUP_get_curve_name(ecdsa_group) != NID_X9_62_prime256v1) {
+-      *error_details = "Invalid leaf cert, only P-256 ECDSA certificates are supported";
+-      break;
++    const int curve = ecdsa_group == nullptr ? NID_undef : EC_GROUP_get_curve_name(ecdsa_group);
++    if (curve == NID_X9_62_prime256v1) {
++      sign_alg = SSL_SIGN_ECDSA_SECP256R1_SHA256;
++    } else if (curve == NID_secp384r1) {
++      sign_alg = SSL_SIGN_ECDSA_SECP384R1_SHA384;
++    } else {
++      *error_details = "Invalid leaf cert, only P-256 and P-384 ECDSA certificates are supported";
+     }
+-    // QUICHE uses SHA-256 as hash function in cert signature.
+-    sign_alg = SSL_SIGN_ECDSA_SECP256R1_SHA256;
+   } break;
+   case EVP_PKEY_RSA: {
+     // We require RSA certificates with 2048-bit or larger keys.
+--- a/source/common/quic/quic_server_transport_socket_factory.cc
++++ b/source/common/quic/quic_server_transport_socket_factory.cc
+@@ -162,7 +162,7 @@
+   auto ctx =
+       std::dynamic_pointer_cast<Extensions::TransportSockets::Tls::ServerContextImpl>(ssl_ctx);
+   auto [tls_context, ocsp_staple_action] =
+-      ctx->findTlsContext(sni, Ssl::CurveNIDVector{NID_X9_62_prime256v1} /* TODO: ecdsa_capable */,
++      ctx->findTlsContext(sni, Ssl::CurveNIDVector{NID_X9_62_prime256v1, NID_secp384r1} /* TODO: peer curves */,
+                           false /* TODO: ocsp_capable */, cert_matched_sni);
+ 
+   // Thread safety note: accessing the tls_context requires holding a shared_ptr to the ``ssl_ctx``.
+--- a/source/common/tls/context_impl.cc
++++ b/source/common/tls/context_impl.cc
+@@ -316,7 +316,7 @@
+ 
+       if (additional_init != nullptr) {
+         absl::Status init_status = additional_init(ctx, tls_certificate);
+-        SET_AND_RETURN_IF_NOT_OK(creation_status, init_status);
++        SET_AND_RETURN_IF_NOT_OK(init_status, creation_status);
+       }
+     }
+   }

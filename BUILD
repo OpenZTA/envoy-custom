@@ -18,6 +18,7 @@ envoy_cc_binary(
     repository = "@envoy",
     stamped = True,
     deps = [
+        "//source/extensions/filters/continuous_authz:continuous_authz",
         "//source/extensions/filters/network/ssh:pomerium_ssh",
         "//source/extensions/health_check/event_sinks/grpc:grpc_event_sink",
         "//source/extensions/http/early_header_mutation/trace_context:pomerium_trace_context",

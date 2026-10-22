@@ -48,6 +48,8 @@ public:
     throw EnvoyException("unexpected call to socketInterface()");
   }
   std::optional<std::string> networkNamespace() const override { return std::nullopt; }
+  // SSH stream addresses are internal channels and have no Linux network namespace.
+  InstanceConstSharedPtr withNetworkNamespace(absl::string_view) const override { return nullptr; }
 
   class FakeEnvoyInternalAddress : public EnvoyInternalAddress {
   public:
