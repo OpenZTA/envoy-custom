@@ -48,6 +48,8 @@ type policyServer struct {
 	unavailable        bool
 	lastSession        string
 	lastRecheck        bool
+	tcpPortResources   map[uint32]string
+	lastTCPPort        uint32
 	subjectFingerprint [32]byte
 }
 
@@ -110,6 +112,19 @@ func (p *policyServer) Check(ctx context.Context, r *auth.CheckRequest) (*auth.C
 		if resource == "" || resource != r.GetAttributes().GetRequest().GetHttp().GetHost() || resource != r.GetAttributes().GetRequest().GetHttp().GetHeaders()["x-original-host"] {
 			return nil, grpc.Errorf(codes.PermissionDenied, "missing or inconsistent resource binding")
 		}
+	} else {
+		port := r.GetAttributes().GetDestination().GetAddress().GetSocketAddress().GetPortValue()
+		p.mu.Lock()
+		p.lastTCPPort = port
+		if p.tcpPortResources != nil {
+			var ok bool
+			resource, ok = p.tcpPortResources[port]
+			if !ok {
+				p.mu.Unlock()
+				return nil, grpc.Errorf(codes.PermissionDenied, "listener resource is not configured")
+			}
+		}
+		p.mu.Unlock()
 	}
 	code := p.verdict(resource, r.GetAttributes().GetSource().GetCertificate(), r.GetAttributes().GetContextExtensions()["openzta.phase"] == "recheck")
 	if code == 503 {
@@ -169,9 +184,18 @@ type gateway struct {
 	activeUpload atomic.Int64
 }
 
+// Restrict fixture backends to a private Docker bridge on public build hosts.
+func fixtureListenAddress() string {
+	host := os.Getenv("OPENZTA_TEST_BIND_IP")
+	if host == "" {
+		host = "0.0.0.0"
+	}
+	return net.JoinHostPort(host, "0")
+}
+
 func listen(t *testing.T) net.Listener {
 	t.Helper()
-	ln, err := net.Listen("tcp", "0.0.0.0:0")
+	ln, err := net.Listen("tcp", fixtureListenAddress())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,8 +437,14 @@ func newGateway(t *testing.T, configure ...func(map[string]any)) *gateway {
 		t.Fatalf("start Envoy: %v %s", err, out)
 	}
 	t.Cleanup(func() {
+		out, logErr := exec.Command("docker", "logs", g.name).CombinedOutput()
+		if logErr != nil {
+			t.Errorf("read Envoy runtime diagnostics: %v", logErr)
+		}
+		if bytes.Contains(out, []byte("[envoy_bug]")) {
+			t.Error("Envoy reported an internal invariant failure")
+		}
 		if t.Failed() {
-			out, _ := exec.Command("docker", "logs", g.name).CombinedOutput()
 			t.Logf("Envoy logs:\n%s", out)
 		}
 		_ = exec.Command("docker", "rm", "-f", g.name).Run()

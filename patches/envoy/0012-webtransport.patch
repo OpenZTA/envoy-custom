@@ -1,0 +1,4055 @@
+--- a/bazel/external/quiche.BUILD
++++ b/bazel/external/quiche.BUILD
+@@ -5505,6 +5505,7 @@
+     ],
+     copts = quiche_copts,
+     repository = "@envoy",
++    visibility = ["//visibility:public"],
+     deps = [
+         ":common_http_http_header_block_lib",
+         ":quiche_common_callbacks",
+--- a/bazel/quiche.patch
++++ b/bazel/quiche.patch
+@@ -138,3 +138,241 @@
+  
+    // |prefix_decoder_| only decodes a handful of bytes then it can be
+    // destroyed to conserve memory.  |instruction_decoder_|, on the other hand,
++
++--- a/quiche/quic/core/frames/quic_reset_stream_at_frame.h
+++++ b/quiche/quic/core/frames/quic_reset_stream_at_frame.h
++@@ -48,8 +48,11 @@
++   // Reverts this to a RST_STREAM frame. If the reliable_offset is not zero,
++   // that information is lost.
++   QuicRstStreamFrame ToRstStream() const {
+++    // RESET_STREAM_AT carries an IETF application code, which can exceed the
+++    // internal enum width (notably WebTransport's 62-bit error-code space).
+++    // Preserve the wire code when synthesizing the effective RESET_STREAM.
++     return QuicRstStreamFrame(control_frame_id, stream_id,
++-                              static_cast<QuicRstStreamErrorCode>(error),
+++                              QuicResetStreamError::FromIetf(error),
++                               final_offset);
++   }
++ };
++--- a/quiche/quic/core/http/http_constants.cc
+++++ b/quiche/quic/core/http/http_constants.cc
++@@ -23,6 +23,8 @@
++     RETURN_STRING_LITERAL(SETTINGS_H3_DATAGRAM);
++     RETURN_STRING_LITERAL(SETTINGS_WEBTRANS_DRAFT00);
++     RETURN_STRING_LITERAL(SETTINGS_WEBTRANS_MAX_SESSIONS_DRAFT07);
+++    RETURN_STRING_LITERAL(SETTINGS_WT_ENABLED);
+++    RETURN_STRING_LITERAL(SETTINGS_WT_MAX_SESSIONS);
++     RETURN_STRING_LITERAL(SETTINGS_ENABLE_CONNECT_PROTOCOL);
++     RETURN_STRING_LITERAL(SETTINGS_ENABLE_METADATA);
++   }
++--- a/quiche/quic/core/http/http_constants.h
+++++ b/quiche/quic/core/http/http_constants.h
++@@ -45,6 +45,8 @@
++   // draft-ietf-webtrans-http3
++   SETTINGS_WEBTRANS_DRAFT00 = 0x2b603742,
++   SETTINGS_WEBTRANS_MAX_SESSIONS_DRAFT07 = 0xc671706a,
+++  SETTINGS_WT_ENABLED = 0x2c7cf000,
+++  SETTINGS_WT_MAX_SESSIONS = 0x14e9cd29,
++   // draft-ietf-httpbis-h3-websockets
++   SETTINGS_ENABLE_CONNECT_PROTOCOL = 0x08,
++   SETTINGS_ENABLE_METADATA = 0x4d44,
++--- a/quiche/quic/core/http/quic_spdy_session.cc
+++++ b/quiche/quic/core/http/quic_spdy_session.cc
++@@ -67,7 +67,7 @@
++ // Only used for Google QUIC, not IETF QUIC.
++ constexpr uint64_t kHpackEncoderDynamicTableSizeLimit = 16384;
++ 
++-constexpr QuicStreamCount kDefaultMaxWebTransportSessions = 16;
+++
++ 
++ #define ENDPOINT \
++   (perspective() == Perspective::IS_SERVER ? "Server: " : "Client: ")
++@@ -649,8 +649,11 @@
++           WT_enabled_extended_connect_disabled,
++           perspective() == Perspective::IS_SERVER && !allow_extended_connect())
++           << "WebTransport enabled, but extended CONNECT is not";
++-      settings_.values[SETTINGS_WEBTRANS_MAX_SESSIONS_DRAFT07] =
++-          kDefaultMaxWebTransportSessions;
+++      // Without WebTransport session-level flow control, only one active
+++      // session per connection is permitted. Native QUIC flow control bounds it.
+++      settings_.values[SETTINGS_WEBTRANS_MAX_SESSIONS_DRAFT07] = 1;
+++      settings_.values[SETTINGS_WT_ENABLED] = 1;
+++      settings_.values[SETTINGS_WT_MAX_SESSIONS] = 1;
++     }
++   }
++   if (allow_extended_connect()) {
++@@ -1369,6 +1372,15 @@
++           }
++         }
++         break;
+++      case SETTINGS_WT_ENABLED: {
+++        if (!WillNegotiateWebTransport()) { break; }
+++        if (!VerifySettingIsZeroOrOne(id, value)) { return false; }
+++        if (value == 1) {
+++          peer_web_transport_versions_.Set(WebTransportHttp3Version::kDraft07);
+++        }
+++        break;
+++      }
+++      case SETTINGS_WT_MAX_SESSIONS:
++       case SETTINGS_WEBTRANS_MAX_SESSIONS_DRAFT07:
++         if (!WillNegotiateWebTransport()) {
++           break;
++@@ -1723,6 +1735,28 @@
++   if (unidirectional && VersionIsIetfQuic(transport_version())) {
++     MaybeInitializeHttp3UnidirectionalStreams();
++   }
+++  if (!SupportsWebTransport()) {
+++    return;
+++  }
+++  // Snapshot IDs before callbacks: opening a stream or a paired-session close can mutate
+++  // the active stream map. Re-resolve each CONNECT rather than retaining raw pointers.
+++  std::vector<QuicStreamId> sessions;
+++  PerformActionOnActiveStreams([&](QuicStream* stream) {
+++    auto* http_stream = dynamic_cast<QuicSpdyStream*>(stream);
+++    if (http_stream != nullptr && http_stream->web_transport() != nullptr) {
+++      sessions.push_back(stream->id());
+++    }
+++    return true;
+++  });
+++  for (QuicStreamId id : sessions) {
+++    if (!connection()->connected()) {
+++      break;
+++    }
+++    auto* http_stream = dynamic_cast<QuicSpdyStream*>(GetActiveStream(id));
+++    if (http_stream != nullptr && http_stream->web_transport() != nullptr) {
+++      http_stream->web_transport()->OnCanCreateNewOutgoingStream(unidirectional);
+++    }
+++  }
++ }
++ 
++ bool QuicSpdySession::goaway_received() const {
++@@ -1869,6 +1903,19 @@
++   stream->OnDatagramReceived(&reader);
++ }
++ 
+++bool QuicSpdySession::HasOtherWebTransportSession(QuicStreamId stream_id) {
+++  bool occupied = false;
+++  PerformActionOnActiveStreams([&](QuicStream* stream) {
+++    auto* http_stream = dynamic_cast<QuicSpdyStream*>(stream);
+++    if (http_stream != nullptr && stream->id() != stream_id && http_stream->web_transport() != nullptr) {
+++      occupied = true;
+++      return false;
+++    }
+++    return true;
+++  });
+++  return occupied;
+++}
+++
++ bool QuicSpdySession::SupportsWebTransport() {
++   return WillNegotiateWebTransport() && SupportsH3Datagram() &&
++          NegotiatedWebTransportVersion().has_value() && allow_extended_connect_;
++--- a/quiche/quic/core/http/quic_spdy_session.h
+++++ b/quiche/quic/core/http/quic_spdy_session.h
++@@ -417,6 +417,7 @@
++ 
++   // Indicates whether the HTTP/3 session supports WebTransport.
++   bool SupportsWebTransport();
+++  bool HasOtherWebTransportSession(QuicStreamId stream_id);
++ 
++   // If SupportsWebTransport() is true, returns the version of WebTransport
++   // currently in use (which is the highest version supported by both peers).
++--- a/quiche/quic/core/http/quic_spdy_stream.cc
+++++ b/quiche/quic/core/http/quic_spdy_stream.cc
++@@ -1431,10 +1431,21 @@
++     }
++   }
++ 
++-  if (method != "CONNECT" || protocol != "webtransport") {
++-    return;
++-  }
++-
+++  if (method != "CONNECT" || (protocol != "webtransport" && protocol != "webtransport-h3")) {
+++    return;
+++  }
+++
+++  // The proxy deliberately uses one session per transport connection. This
+++  // satisfies draft-16 without advertising unsupported session flow control,
+++  // and prevents one origin from starving another session on the connection.
+++  if (spdy_session_->HasOtherWebTransportSession(id())) {
+++    Reset(QUIC_REFUSED_STREAM);
+++    return;
+++  }
+++  if (protocol == "webtransport-h3" && !session()->connection()->reliable_stream_reset_enabled()) {
+++    Reset(QUIC_BAD_APPLICATION_PAYLOAD);
+++    return;
+++  }
++   web_transport_ =
++       std::make_unique<WebTransportHttp3>(spdy_session_, this, id());
++ }
++@@ -1457,7 +1468,8 @@
++   if (method_it == headers.end() || protocol_it == headers.end()) {
++     return;
++   }
++-  if (method_it->second != "CONNECT" && protocol_it->second != "webtransport") {
+++  if (method_it->second != "CONNECT" ||
+++      (protocol_it->second != "webtransport" && protocol_it->second != "webtransport-h3")) {
++     return;
++   }
++ 
++@@ -1466,6 +1478,17 @@
++     headers["sec-webtransport-http3-draft02"] = "1";
++   }
++ 
+++  // The proxy deliberately uses one session per transport connection. This
+++  // satisfies draft-16 without advertising unsupported session flow control,
+++  // and prevents one origin from starving another session on the connection.
+++  if (spdy_session_->HasOtherWebTransportSession(id())) {
+++    Reset(QUIC_REFUSED_STREAM);
+++    return;
+++  }
+++  if (protocol_it->second == "webtransport-h3" && !session()->connection()->reliable_stream_reset_enabled()) {
+++    Reset(QUIC_BAD_APPLICATION_PAYLOAD);
+++    return;
+++  }
++   web_transport_ =
++       std::make_unique<WebTransportHttp3>(spdy_session_, this, id());
++ 
++--- a/quiche/quic/core/http/quic_spdy_stream.h
+++++ b/quiche/quic/core/http/quic_spdy_stream.h
++@@ -287,7 +287,7 @@
++   }
++ 
++   // Sends a WEBTRANSPORT_STREAM frame and sets up the appropriate metadata.
++-  void ConvertToWebTransportDataStream(WebTransportSessionId session_id);
+++  virtual void ConvertToWebTransportDataStream(WebTransportSessionId session_id);
++ 
++   void OnCanWriteNewData() override;
++ 
++--- a/quiche/quic/core/http/web_transport_http3.cc
+++++ b/quiche/quic/core/http/web_transport_http3.cc
++@@ -166,6 +166,18 @@
++   }
++ 
++   connect_stream_->WriteOrBufferBody("", /*fin=*/true);
+++}
+++
+++void WebTransportHttp3::OnCanCreateNewOutgoingStream(bool unidirectional) {
+++  if (!ready_ || close_sent_ || close_received_ || close_notified_) {
+++    return;
+++  }
+++  // A callback may close the CONNECT and destroy this session; do not touch members afterward.
+++  if (unidirectional) {
+++    visitor_->OnCanCreateNewOutgoingUnidirectionalStream();
+++  } else {
+++    visitor_->OnCanCreateNewOutgoingBidirectionalStream();
+++  }
++ }
++ 
++ void WebTransportHttp3::HeadersReceived(
++--- a/quiche/quic/core/http/web_transport_http3.h
+++++ b/quiche/quic/core/http/web_transport_http3.h
++@@ -60,6 +60,9 @@
++   WebTransportSessionId id() { return id_; }
++   bool ready() { return ready_; }
++ 
+++  // Notify the session visitor after QUIC MAX_STREAMS grants new stream credit.
+++  void OnCanCreateNewOutgoingStream(bool unidirectional);
+++
++   void AssociateStream(QuicStreamId stream_id);
++   void OnStreamClosed(QuicStreamId stream_id) { streams_.erase(stream_id); }
++   void OnConnectStreamClosing();
+--- a/envoy/http/codec.h
++++ b/envoy/http/codec.h
+@@ -21,8 +21,42 @@
+ 
+ #include "source/common/http/status.h"
+ 
++namespace webtransport {
++class Session;
++class SessionVisitor;
++} // namespace webtransport
++
+ namespace Envoy {
+ namespace Http {
++
++// TODO(wbpcode): The webtransport::Session should be used ideally. However, the
++// webtransport::Session does not provide the SetVisitor method which is necessary for bridging the
++// downstream and upstream session.
++class WebTransportSession {
++public:
++  virtual ~WebTransportSession() = default;
++
++  /**
++   * Set a visitor for this WebTransport session. The visitor will be notified of session-level
++   * events such as incoming streams and datagrams. This is only used for negotiated WebTransport
++   * sessions, and should not be set for non-WebTransport sessions.
++   *
++   * @param visitor supplies the visitor to set.
++   */
++  virtual void setWebTransportVisitor(std::unique_ptr<webtransport::SessionVisitor> visitor) PURE;
++
++  /**
++   * @return a pointer to the webtransport::Session.
++   */
++  virtual webtransport::Session* rawWebTransportSession() PURE;
++  virtual void sendWebTransportDatagram(absl::string_view) {}
++  // Both codecs and the HTTP filter execute on the owning worker dispatcher.
++  // Disable forwarding before resetting CONNECT so reentrant stream callbacks
++  // cannot send buffered data after a policy denial.
++  virtual std::shared_ptr<bool> webTransportForwardingGuard() { return {}; }
++  virtual void disableWebTransportForwarding() {}
++
++};
+ 
+ enum class CodecType { HTTP1, HTTP2, HTTP3 };
+ 
+@@ -331,6 +365,16 @@
+    * the handle.
+    */
+   virtual ResponseDecoderHandlePtr createResponseDecoderHandle() PURE;
++
++  /**
++   * @return the WebTransport session of the *downstream* stream paired with this decoder, if any.
++   *
++   * Only decoders on the router's upstream path (which are paired 1:1 with a downstream stream)
++   * implement this; they reach the downstream StreamDecoderFilterCallbacks and return its
++   * webTransportSession(). It lets the upstream codec obtain the downstream WebTransport session so
++   * it can bridge the two directly. All other response decoders inherit the default empty OptRef.
++   */
++  virtual OptRef<WebTransportSession> downstreamWebTransportSession() { return {}; }
+ };
+ 
+ /**
+@@ -473,6 +517,13 @@
+    * HTTP/3 streams return the HTTP/3 stream ID or nullopt if not available.
+    */
+   virtual absl::optional<uint32_t> codecStreamId() const PURE;
++
++  /**
++   * @return the WebTransport session this stream carries, if it is a negotiated WebTransport
++   * CONNECT stream. Only HTTP/3 codec streams that have created a WebTransportHttp3 session return
++   * a value; all other streams inherit the default empty OptRef.
++   */
++  virtual OptRef<WebTransportSession> webTransportSession() { return {}; }
+ };
+ 
+ /**
+--- a/envoy/http/filter.h
++++ b/envoy/http/filter.h
+@@ -228,6 +228,11 @@
+   // Returns a handle to the upstream stream's stream info.
+   virtual StreamInfo::StreamInfo& upstreamStreamInfo() PURE;
+ 
++  // Returns the WebTransport session of the *downstream* stream paired with this upstream request,
++  // if any. Used by the upstream WebTransport codec to obtain the downstream session so it can
++  // bridge the two. Defaults to an empty OptRef for non-WebTransport streams.
++  virtual OptRef<WebTransportSession> downstreamWebTransportSession() { return {}; }
++
+   // Returns a handle to the generic upstream.
+   virtual OptRef<Router::GenericUpstream> upstream() PURE;
+ 
+@@ -581,6 +586,17 @@
+ class StreamDecoderFilterCallbacks : public virtual StreamFilterCallbacks {
+ public:
+   /**
++   * @return the WebTransport session of the stream this decoder filter chain is bound to, if any.
++   *
++   * For the downstream HTTP connection manager this returns the downstream codec stream's
++   * WebTransport session. It lets the upstream WebTransport codec obtain the downstream session
++   * (via the router/upstream-callbacks chain) and bridge the two directly, without going through
++   * filter state. Filters/chains not carrying a WebTransport session inherit the default empty
++   * OptRef.
++   */
++  virtual OptRef<WebTransportSession> webTransportSession() { return {}; }
++
++  /**
+    * Continue iterating through the filter chain with buffered headers and body data. This routine
+    * can only be called if the filter has previously returned StopIteration from decodeHeaders()
+    * AND one of StopIterationAndBuffer, StopIterationAndWatermark, or StopIterationNoBuffer
+--- a/source/common/conn_pool/conn_pool_base.cc
++++ b/source/common/conn_pool/conn_pool_base.cc
+@@ -262,6 +262,14 @@
+   // For HTTP/3, the capacity is updated in newStreamEncoder.
+   if (trackStreamCapacity()) {
+     decrConnectingAndConnectedStreamCapacity(1, client);
++  } else {
++    // HTTP/3 accounts for QUIC stream IDs in newStreamEncoder(). The lifetime
++    // request limit has already changed above, however, and can lower capacity
++    // before that callback observes it (in particular, max_requests=1). Charge
++    // that change here; the codec then accounts only for any further decrease.
++    const uint64_t remaining_capacity = client.currentUnusedCapacity();
++    ASSERT(remaining_capacity <= capacity);
++    decrConnectingAndConnectedStreamCapacity(capacity - remaining_capacity, client);
+   }
+   // Track the new active stream.
+   cluster_connectivity_state_.incrActiveStreams(1);
+--- a/source/common/http/codec_wrappers.h
++++ b/source/common/http/codec_wrappers.h
+@@ -74,6 +74,13 @@
+     } else {
+       onInnerDecoderDead();
+     }
++  }
++
++  OptRef<WebTransportSession> downstreamWebTransportSession() override {
++    if (Http::ResponseDecoder* inner = getInnerDecoder()) {
++      return inner->downstreamWebTransportSession();
++    }
++    return {};
+   }
+ 
+ protected:
+--- a/source/common/http/conn_manager_impl.h
++++ b/source/common/http/conn_manager_impl.h
+@@ -238,6 +238,12 @@
+     }
+ 
+     // FilterManagerCallbacks
++    OptRef<WebTransportSession> webTransportSession() override {
++      if (response_encoder_ == nullptr) {
++        return {};
++      }
++      return response_encoder_->getStream().webTransportSession();
++    }
+     void encodeHeaders(ResponseHeaderMap& response_headers, bool end_stream) override;
+     void encode1xxHeaders(ResponseHeaderMap& response_headers) override;
+     void encodeData(Buffer::Instance& data, bool end_stream) override;
+--- a/source/common/http/filter_manager.cc
++++ b/source/common/http/filter_manager.cc
+@@ -491,6 +491,10 @@
+   }
+   parent_.decodeData(this, data, end_stream,
+                      FilterManager::FilterIterationStartState::CanStartFromCurrent);
++}
++
++OptRef<WebTransportSession> ActiveStreamDecoderFilter::webTransportSession() {
++  return parent_.webTransportSession();
+ }
+ 
+ void ActiveStreamDecoderFilter::continueDecoding() { commonContinue(); }
+--- a/source/common/http/filter_manager.h
++++ b/source/common/http/filter_manager.h
+@@ -268,6 +268,7 @@
+   void handleMetadataAfterHeadersCallback() override;
+ 
+   // Http::StreamDecoderFilterCallbacks
++  OptRef<WebTransportSession> webTransportSession() override;
+   void addDecodedData(Buffer::Instance& data, bool streaming) override;
+   void injectDecodedDataToFilterChain(Buffer::Instance& data, bool end_stream) override;
+   RequestTrailerMap& addDecodedTrailers() override;
+@@ -387,6 +388,13 @@
+   virtual ~FilterManagerCallbacks() = default;
+ 
+   /**
++   * @return the WebTransport session of the codec stream this filter manager is bound to, if any.
++   * The downstream HTTP connection manager returns the downstream codec stream's session; the
++   * default empty OptRef applies elsewhere.
++   */
++  virtual OptRef<WebTransportSession> webTransportSession() { return {}; }
++
++  /**
+    * Called when the provided headers have been encoded by all the filters in the chain.
+    * @param response_headers the encoded headers.
+    * @param end_stream whether this is a header only response.
+@@ -690,6 +698,12 @@
+   ~FilterManager() override {
+     ASSERT(state_.destroyed_);
+     ASSERT(state_.filter_call_state_ == 0);
++  }
++
++  // Returns the WebTransport session of the codec stream this filter manager is bound to, if any.
++  // Delegates to the FilterManagerCallbacks (e.g. the HTTP connection manager's ActiveStream).
++  OptRef<WebTransportSession> webTransportSession() {
++    return filter_manager_callbacks_.webTransportSession();
+   }
+ 
+   // ScopeTrackedObject
+--- a/source/common/http/headers.h
++++ b/source/common/http/headers.h
+@@ -338,6 +338,8 @@
+   struct {
+     // per https://tools.ietf.org/html/draft-kinnear-httpbis-http2-transport-02
+     const std::string Bytestream{"bytestream"};
++    // per https://datatracker.ietf.org/doc/draft-ietf-webtrans-overview/
++    const std::string WebTransport{"webtransport"};
+   } ProtocolValues;
+ 
+   struct {
+--- a/source/common/quic/BUILD
++++ b/source/common/quic/BUILD
+@@ -295,6 +295,7 @@
+         "//source/common/common:assert_lib",
+         "//source/common/http:header_map_lib",
+         "@com_github_google_quiche//:quic_server_http_spdy_session_lib",
++        "@com_github_google_quiche//:quic_core_http_server_initiated_spdy_stream_lib",
+         "@com_google_absl//absl/types:optional",
+     ]) + envoy_select_enable_http_datagrams([
+         ":http_datagram_handler",
+@@ -335,6 +336,7 @@
+         "@com_github_google_quiche//:quic_core_error_codes_lib",
+     ]) + envoy_select_enable_http_datagrams([
+         ":http_datagram_handler",
++        ":web_transport_session_bridge_lib",
+     ]),
+ )
+ 
+@@ -535,6 +537,7 @@
+         "//source/common/quic:cert_compression_lib",
+         "//source/common/tls:client_ssl_socket_lib",
+         "//source/common/tls:context_config_lib",
++        "//source/common/tls:context_lib",
+         "@com_github_google_quiche//:quic_core_crypto_crypto_handshake_lib",
+         "@envoy_api//envoy/extensions/transport_sockets/quic/v3:pkg_cc_proto",
+     ]),
+@@ -745,3 +748,19 @@
+         "//source/common/runtime:runtime_lib",
+     ]),
+ )
++
++
++envoy_cc_library(
++    name = "web_transport_session_bridge_lib",
++    srcs = envoy_select_enable_http3(["web_transport_session_bridge.cc"]),
++    hdrs = envoy_select_enable_http3(["web_transport_session_bridge.h"]),
++    deps = envoy_select_enable_http3([
++        ":send_buffer_monitor_lib",
++        "//envoy/http:codec_interface",
++        "@com_github_google_quiche//:quic_core_http_spdy_session_lib",
++        "//source/common/common:logger_lib",
++        "@com_github_google_quiche//:quiche_common_buffer_allocator_lib",
++        "@com_github_google_quiche//:quiche_common_capsule_lib",
++        "@com_github_google_quiche//:quiche_web_transport_web_transport_lib",
++    ]),
++)
+--- a/source/common/quic/envoy_quic_client_session.cc
++++ b/source/common/quic/envoy_quic_client_session.cc
+@@ -11,6 +11,7 @@
+ #include "source/common/quic/envoy_quic_utils.h"
+ #include "source/common/quic/quic_filter_manager_connection_impl.h"
+ #include "source/common/quic/quic_network_connectivity_observer_impl.h"
++#include "source/common/runtime/runtime_features.h"
+ 
+ namespace Envoy {
+ namespace Quic {
+@@ -126,6 +127,23 @@
+   }
+ }
+ 
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++quic::WebTransportHttp3VersionSet
++EnvoyQuicClientSession::LocallySupportedWebTransportVersions() const {
++  if (!Runtime::runtimeFeatureEnabled("envoy.reloadable_features.quic_support_web_transport")) {
++    return {};
++  }
++  return quic::kDefaultSupportedWebTransportVersions;
++}
++void EnvoyQuicClientSession::registerStreamWaitingForSettings(quic::QuicStreamId stream_id) {
++  streams_waiting_for_settings_.insert(stream_id);
++}
++
++void EnvoyQuicClientSession::unregisterStreamWaitingForSettings(quic::QuicStreamId stream_id) {
++  streams_waiting_for_settings_.erase(stream_id);
++}
++#endif
++
+ absl::string_view EnvoyQuicClientSession::requestedServerName() const { return server_id().host(); }
+ 
+ void EnvoyQuicClientSession::connect() {
+@@ -156,6 +174,11 @@
+ }
+ 
+ void EnvoyQuicClientSession::Initialize() {
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.quic_support_web_transport")) {
++    config()->SetReliableStreamReset(true);
++  }
++#endif
+   quic::QuicSpdyClientSession::Initialize();
+   initialized_ = true;
+   network_connection_->setEnvoyConnection(*this, *this);
+@@ -184,6 +207,7 @@
+ }
+ 
+ void EnvoyQuicClientSession::OnCanCreateNewOutgoingStream(bool unidirectional) {
++  quic::QuicSpdyClientSession::OnCanCreateNewOutgoingStream(unidirectional);
+   if (!http_connection_callbacks_ || unidirectional) {
+     return;
+   }
+@@ -198,8 +222,12 @@
+                                                  http3_options_.value());
+ }
+ 
+-quic::QuicSpdyStream* EnvoyQuicClientSession::CreateIncomingStream(quic::QuicStreamId /*id*/) {
+-  // Envoy doesn't support server initiated stream.
++quic::QuicSpdyStream* EnvoyQuicClientSession::CreateIncomingStream(quic::QuicStreamId id) {
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  if (SupportsWebTransport()) {
++    return quic::QuicSpdyClientSession::CreateIncomingStream(id);
++  }
++#endif
+   return nullptr;
+ }
+ 
+@@ -241,6 +269,30 @@
+       dispatcher_.timeSource());
+ 
+   raiseConnectionEvent(Network::ConnectionEvent::Connected);
++}
++
++bool EnvoyQuicClientSession::OnSettingsFrame(const quic::SettingsFrame& frame) {
++  if (!quic::QuicSpdyClientSession::OnSettingsFrame(frame)) {
++    // The base implementation may close the connection on invalid settings.
++    return false;
++  }
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  // The peer's SETTINGS (carrying WebTransport/HTTP Datagram negotiation) are now known. Write any
++  // WebTransport CONNECT requests whose encodeHeaders() was deferred because QUICHE only creates
++  // the upstream WebTransport session at header-write time and only if WebTransport is already
++  // negotiated. Move the set aside first so a flush that somehow re-registers (it should not, since
++  // settings_received() is now true) cannot mutate what we iterate.
++  absl::flat_hash_set<quic::QuicStreamId> waiting = std::move(streams_waiting_for_settings_);
++  streams_waiting_for_settings_.clear();
++  for (quic::QuicStreamId stream_id : waiting) {
++    // The stream may have been reset/closed while waiting; GetActiveStream() returns nullptr then,
++    // so a stale ID is harmless.
++    if (auto* stream = GetActiveStream(stream_id); stream != nullptr) {
++      static_cast<EnvoyQuicClientStream*>(stream)->flushPendingHeaders();
++    }
++  }
++#endif
++  return true;
+ }
+ 
+ std::unique_ptr<quic::QuicCryptoClientStreamBase> EnvoyQuicClientSession::CreateQuicCryptoStream() {
+--- a/source/common/quic/envoy_quic_client_session.h
++++ b/source/common/quic/envoy_quic_client_session.h
+@@ -11,6 +11,7 @@
+ #include "source/common/quic/quic_stat_names.h"
+ #include "source/common/quic/quic_transport_socket_factory.h"
+ 
++#include "absl/container/flat_hash_set.h"
+ #include "quiche/quic/core/http/quic_spdy_client_session.h"
+ 
+ namespace Envoy {
+@@ -77,8 +78,30 @@
+   void StartDraining() override;
+ 
+   quic::HttpDatagramSupport LocalHttpDatagramSupport() override { return http_datagram_support_; }
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  quic::WebTransportHttp3VersionSet LocallySupportedWebTransportVersions() const override;
++#endif
+   std::vector<std::string> GetAlpnsToOffer() const override;
+   void OnConfigNegotiated() override;
++
++  // quic::QuicSpdySession
++  // Overridden to flush WebTransport CONNECT requests that were deferred until the peer's HTTP/3
++  // SETTINGS arrived. See registerStreamWaitingForSettings().
++  bool OnSettingsFrame(const quic::SettingsFrame& frame) override;
++
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  // Registers/unregisters a client stream that buffered a WebTransport CONNECT request in
++  // encodeHeaders() because the peer's HTTP/3 SETTINGS had not yet been received. QUICHE creates
++  // the upstream WebTransport session synchronously inside WriteHeaders, but only if WebTransport
++  // is already negotiated (which is known only after SETTINGS). When the SETTINGS frame arrives,
++  // OnSettingsFrame() flushes every registered stream. Streams are tracked by ID rather than
++  // pointer: a stream that is destroyed without unregistering simply fails the GetActiveStream()
++  // lookup at flush time, so there is no dangling reference. Only WebTransport CONNECT streams ever
++  // wait here; all other requests are written immediately and the connection becomes ready right
++  // after the handshake.
++  void registerStreamWaitingForSettings(quic::QuicStreamId stream_id);
++  void unregisterStreamWaitingForSettings(quic::QuicStreamId stream_id);
++#endif
+ 
+   // quic::QuicSpdyClientSessionBase
+   bool ShouldKeepConnectionAlive() const override;
+@@ -132,6 +155,12 @@
+ private:
+   uint64_t streamsAvailable();
+ 
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  // IDs of client streams that buffered a WebTransport CONNECT request awaiting the peer's HTTP/3
++  // SETTINGS. Flushed and cleared in OnSettingsFrame(). See registerStreamWaitingForSettings().
++  absl::flat_hash_set<quic::QuicStreamId> streams_waiting_for_settings_;
++#endif
++
+   // These callbacks are owned by network filters and quic session should outlive
+   // them.
+   Http::ConnectionCallbacks* http_connection_callbacks_{nullptr};
+--- a/source/common/quic/envoy_quic_client_stream.cc
++++ b/source/common/quic/envoy_quic_client_stream.cc
+@@ -11,8 +11,15 @@
+ #include "source/common/quic/envoy_quic_utils.h"
+ #include "source/common/runtime/runtime_features.h"
+ 
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++#include "source/common/quic/web_transport_session_bridge.h"
++#endif
++
+ #include "quiche/common/http/http_header_block.h"
+ #include "quiche/quic/core/http/quic_header_list.h"
++#include "quiche/quic/core/quic_data_writer.h"
++#include "quiche/common/quiche_mem_slice.h"
++#include "quiche/common/simple_buffer_allocator.h"
+ #include "quiche/quic/core/quic_session.h"
+ #include "quiche/quic/core/quic_types.h"
+ 
+@@ -60,6 +67,30 @@
+   if (write_side_closed()) {
+     return absl::CancelledError("encodeHeaders is called on write-closed stream.");
+   }
++
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  // A WebTransport CONNECT can only be written once the peer's HTTP/3 SETTINGS have been received:
++  // QUICHE creates the upstream WebTransport session synchronously inside WriteHeaders, but only if
++  // WebTransport is already negotiated (SupportsWebTransport()), which is known only after
++  // SETTINGS. If SETTINGS haven't arrived yet, buffer the request and replay this method from
++  // flushPendingHeaders() when OnSettingsFrame() fires. Only this one stream waits; every other
++  // request on the connection is written immediately.
++  if (!spdy_session()->settings_received()) {
++    // The headers may have been transformed by UHV or not, so we check both the upgrade and
++    // protocol headers for WebTransport values.
++    if (headers.getProtocolValue() == "webtransport" || headers.getProtocolValue() == "webtransport-h3" ||
++        headers.getUpgradeValue() == "webtransport" || headers.getUpgradeValue() == "webtransport-h3") {
++      ENVOY_STREAM_LOG(debug, "Deferring WebTransport CONNECT until peer HTTP/3 SETTINGS received.",
++                       *this);
++      // TODO(wbpcode): could we avoid this copy by keeping the reference only here because the
++      // request headers should never be released before the stream is closed?
++      pending_webtransport_headers_ = Http::createHeaderMap<Http::RequestHeaderMapImpl>(headers);
++      pending_webtransport_end_stream_ = end_stream;
++      static_cast<EnvoyQuicClientSession*>(session())->registerStreamWaitingForSettings(id());
++      return Http::okStatus();
++    }
++  }
++#endif
+ 
+   local_end_stream_ = end_stream;
+   SendBufferMonitor::ScopedWatermarkBufferUpdater updater(this, this);
+@@ -98,23 +129,25 @@
+     sent_head_request_ = true;
+   }
+ #endif
+-#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
+-  if (Http::HeaderUtility::isCapsuleProtocol(headers) ||
+-      Http::HeaderUtility::isConnectUdpRequest(headers)) {
+-    useCapsuleProtocol();
+-    if (Http::HeaderUtility::isConnectUdpRequest(headers)) {
+-      // HTTP/3 Datagrams sent over CONNECT-UDP are already congestion controlled, so make it
+-      // bypass the default Datagram queue.
+-      session()->SetForceFlushForDefaultQueue(true);
+-    }
+-  }
+-#endif
+   addDecompressedHeaderBytesSent(spdy_headers);
+   {
+     IncrementalBytesSentTracker tracker(*this, *mutableBytesMeter(), true);
+     size_t bytes_sent = WriteHeaders(std::move(spdy_headers), end_stream, nullptr);
+     ENVOY_BUG(bytes_sent != 0, "Failed to encode headers.");
+   }
++
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  if (Http::HeaderUtility::isCapsuleProtocol(headers) ||
++      Http::HeaderUtility::isConnectUdpRequest(headers)) {
++    // HTTP/3 Datagrams sent over CONNECT-UDP are already congestion controlled, so make it bypass
++    // the default Datagram queue.
++    if (useCapsuleProtocol()) {
++      if (Http::HeaderUtility::isConnectUdpRequest(headers)) {
++        session()->SetForceFlushForDefaultQueue(true);
++      }
++    }
++  }
++#endif
+ 
+   if (local_end_stream_) {
+     if (codec_callbacks_) {
+@@ -199,6 +232,19 @@
+ 
+   const absl::optional<uint64_t> optional_status =
+       Http::Utility::getResponseStatusOrNullopt(*headers);
++
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  // Envoy parses response headers itself rather than calling the QUICHE
++  // client's header handler. Complete its WebTransport readiness transition as
++  // well, or MAX_STREAMS notifications are discarded while ready() stays false.
++  if (web_transport() != nullptr && Http::CodeUtility::is2xx(optional_status.value_or(0))) {
++    web_transport()->HeadersReceived(envoyHeadersToHttp2HeaderBlock(*headers));
++  }
++  if (!mayInitializeWebTransportState(optional_status.value_or(0))) {
++    return;
++  }
++#endif
++
+ #ifndef ENVOY_ENABLE_UHV
+   if (!optional_status.has_value()) {
+     details_ = Http3ResponseCodeDetailValues::invalid_http_header;
+@@ -276,6 +322,13 @@
+   // Only called in IETF Quic to close write side.
+   ENVOY_STREAM_LOG(debug, "received STOP_SENDING with reset code={}", *this,
+                    static_cast<int>(error.internal_code()));
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  if (web_transport_stream() != nullptr) {
++    stats_.rx_reset_.inc();
++    SendBufferMonitor::ScopedWatermarkBufferUpdater updater(this, this);
++    return quic::QuicSpdyClientStream::OnStopSending(error);
++  }
++#endif
+   bool end_stream_encoded = local_end_stream_;
+   // This call will close write.
+   if (!quic::QuicSpdyClientStream::OnStopSending(error)) {
+@@ -418,6 +471,8 @@
+ 
+ void EnvoyQuicClientStream::OnConnectionClosed(const quic::QuicConnectionCloseFrame& frame,
+                                                quic::ConnectionCloseSource source) {
++  // Stop child forwarding before QUICHE walks streams during connection teardown.
++  disableWebTransportForwarding();
+   if (!end_stream_decoded_) {
+     runResetCallbacks(source == quic::ConnectionCloseSource::FROM_SELF
+                           ? quicErrorCodeToEnvoyLocalResetReason(frame.quic_error_code,
+@@ -431,6 +486,26 @@
+ }
+ 
+ void EnvoyQuicClientStream::OnClose() {
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  if (web_transport() != nullptr && !end_stream_decoded_) {
++    // QUICHE consumes WebTransport close capsules and FIN without calling our
++    // HTTP decoder. Release the router's encoder reference before this stream
++    // can be destroyed. A later downstream connection close must not reset a
++    // CONNECT whose encoder has already gone away. Reset callbacks run once.
++    disableWebTransportForwarding();
++    runResetCallbacks(Http::StreamResetReason::RemoteReset,
++                      "openzta_webtransport_connect_closed");
++  }
++#endif
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  if (pending_webtransport_headers_ != nullptr) {
++    // The stream is being torn down while still waiting for the peer's SETTINGS to flush a deferred
++    // WebTransport CONNECT. Drop the buffered headers and unregister so the session does not flush
++    // a destroyed stream.
++    pending_webtransport_headers_.reset();
++    static_cast<EnvoyQuicClientSession*>(session())->unregisterStreamWaitingForSettings(id());
++  }
++#endif
+   destroy();
+   quic::QuicSpdyClientStream::OnClose();
+   if (isDoingWatermarkAccounting()) {
+@@ -504,12 +568,54 @@
+ // TODO(https://github.com/envoyproxy/envoy/issues/23564): Make the stream use Capsule Protocol
+ // for CONNECT-UDP support when the headers contain "Capsule-Protocol: ?1" or "Upgrade:
+ // connect-udp".
+-void EnvoyQuicClientStream::useCapsuleProtocol() {
++bool EnvoyQuicClientStream::useCapsuleProtocol() {
++  if (uses_capsules()) {
++    return false;
++  }
+   http_datagram_handler_ = std::make_unique<HttpDatagramHandler>(*this);
+   http_datagram_handler_->setStreamDecoderProvider(
+       [this]() -> Http::StreamDecoder* { return getResponseDecoder(); });
+   RegisterHttp3DatagramVisitor(http_datagram_handler_.get());
+-}
++  return true;
++}
++
++bool EnvoyQuicClientStream::mayInitializeWebTransportState(uint64_t status_code) {
++  if (!Http::CodeUtility::is2xx(status_code)) {
++    return true;
++  }
++  Http::ResponseDecoder* decoder = getResponseDecoder();
++  if (decoder == nullptr) {
++    return true;
++  }
++  OptRef<Http::WebTransportSession> downstream_session = decoder->downstreamWebTransportSession();
++  if (!downstream_session.has_value()) {
++    return true;
++  }
++  // A bare 200 from an HTTP/3 server is not a negotiated WebTransport session.
++  // Fail before forwarding success downstream, which would leave unusable child streams.
++  if (web_transport() == nullptr || !web_transport()->ready()) {
++    details_ = "openzta_webtransport_upstream_not_negotiated";
++    Reset(quic::QUIC_BAD_APPLICATION_PAYLOAD);
++    return false;
++  }
++  WebTransportSessionBridge::installBridge(downstream_session.ref(), *this);
++  return true;
++}
++
++void EnvoyQuicClientStream::flushPendingHeaders() {
++  if (pending_webtransport_headers_ == nullptr) {
++    return;
++  }
++  ENVOY_STREAM_LOG(debug, "Flushing deferred WebTransport CONNECT after peer HTTP/3 SETTINGS.",
++                   *this);
++  Http::RequestHeaderMapPtr headers = std::move(pending_webtransport_headers_);
++  // settings_received() is now true, so this replay writes the request instead of deferring again.
++  // Ignore the status: the original encodeHeaders() caller already received okStatus, and any error
++  // here (e.g. the stream was reset while waiting) is surfaced through the stream's reset
++  // callbacks.
++  encodeHeaders(*headers, pending_webtransport_end_stream_).IgnoreError();
++}
++
+ #endif
+ 
+ void EnvoyQuicClientStream::OnInvalidHeaders() {
+@@ -537,5 +643,34 @@
+   return nullptr;
+ }
+ 
++void EnvoyQuicClientStream::ConvertToWebTransportDataStream(
++    quic::WebTransportSessionId session_id) {
++  if (!session()->connection()->connected() || write_side_closed()) { return; }
++  SendBufferMonitor::ScopedWatermarkBufferUpdater updater(this, this);
++  quic::QuicSpdyClientStream::ConvertToWebTransportDataStream(session_id);
++}
++
++void EnvoyQuicClientStream::WriteOrBufferBody(absl::string_view data, bool fin) {
++  // QUICHE can generate a close capsule from a paired session callback while
++  // this connection is already being torn down. No stream write is legal then.
++  if (!session()->connection()->connected() || write_side_closed()) { return; }
++  SendBufferMonitor::ScopedWatermarkBufferUpdater updater(this, this);
++  quic::QuicSpdyClientStream::WriteOrBufferBody(data, fin);
++}
++
++void EnvoyQuicClientStream::sendWebTransportDatagram(absl::string_view payload) {
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  if (web_transport() == nullptr || !session()->connection()->connected() || write_side_closed() ||
++      payload.size() > GetMaxDatagramSize()) { return; }
++  const uint64_t quarter_id = id() / 4;
++  const size_t size = quic::QuicDataWriter::GetVarInt62Len(quarter_id) + payload.size();
++  quiche::QuicheBuffer buffer(quiche::SimpleBufferAllocator::Get(), size);
++  quic::QuicDataWriter writer(size, buffer.data());
++  if (!writer.WriteVarInt62(quarter_id) || !writer.WriteBytes(payload.data(), payload.size())) { return; }
++  quiche::QuicheMemSlice slice(std::move(buffer));
++  session()->SendDatagram(absl::Span<quiche::QuicheMemSlice>(&slice, 1), true);
++#endif
++}
++
+ } // namespace Quic
+ } // namespace Envoy
+--- a/source/common/quic/envoy_quic_client_stream.h
++++ b/source/common/quic/envoy_quic_client_stream.h
+@@ -1,4 +1,6 @@
+ #pragma once
++
++#include <cstdint>
+ 
+ #include "envoy/buffer/buffer.h"
+ 
+@@ -10,6 +12,7 @@
+ #endif
+ #include "quiche/common/simple_buffer_allocator.h"
+ #include "quiche/quic/core/http/quic_spdy_client_stream.h"
++#include "quiche/quic/core/http/web_transport_http3.h"
+ #include "quiche/quic/core/qpack/qpack_encoder.h"
+ #include "quiche/quic/core/qpack/qpack_instruction_encoder.h"
+ 
+@@ -20,13 +23,21 @@
+ class EnvoyQuicClientStream : public quic::QuicSpdyClientStream,
+                               public EnvoyQuicStream,
+                               public Http::RequestEncoder,
+-                              public quic::QuicSpdyStream::MetadataVisitor {
++                              public quic::QuicSpdyStream::MetadataVisitor,
++                              public Http::WebTransportSession {
+ public:
+   EnvoyQuicClientStream(quic::QuicStreamId id, quic::QuicSpdyClientSession* client_session,
+                         quic::StreamType type, Http::Http3::CodecStats& stats,
+                         const envoy::config::core::v3::Http3ProtocolOptions& http3_options);
+ 
+   void setResponseDecoder(Http::ResponseDecoder& decoder);
++
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  // Writes a WebTransport CONNECT request whose encodeHeaders() was deferred until the peer's
++  // HTTP/3 SETTINGS arrived (see encodeHeaders()). Called by
++  // EnvoyQuicClientSession::OnSettingsFrame(). A no-op if no request is pending.
++  void flushPendingHeaders();
++#endif
+ 
+   // Http::StreamEncoder
+   Http::Http1StreamEncoderOptionsOptRef http1StreamEncoderOptions() override {
+@@ -42,12 +53,27 @@
+   void resetStream(Http::StreamResetReason reason) override;
+   void setFlushTimeout(std::chrono::milliseconds) override {}
+   absl::optional<uint32_t> codecStreamId() const override { return id(); }
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  // Exposes this stream's WebTransport session (created by QUICHE for a negotiated WebTransport
++  // CONNECT) through the codec Stream interface, mirroring EnvoyQuicServerStream. Lets tests reach
++  // the session via Http::Stream. Empty OptRef when this is not a WebTransport stream.
++  OptRef<Http::WebTransportSession> webTransportSession() override {
++    if (auto* session = web_transport(); session != nullptr) {
++      return *this;
++    }
++    return {};
++  }
++#endif
+ 
+   // quic::QuicStream
+   void OnStreamFrame(const quic::QuicStreamFrame& frame) override;
+   bool OnStopSending(quic::QuicResetStreamError error) override;
+   // quic::QuicSpdyStream
+   void OnBodyAvailable() override;
++  // QUICHE also writes WebTransport prefaces and close capsules directly,
++  // outside the HTTP encoder. Include those bytes in connection watermarks.
++  void ConvertToWebTransportDataStream(quic::WebTransportSessionId session_id) override;
++  void WriteOrBufferBody(absl::string_view data, bool fin) override;
+   void OnStreamReset(const quic::QuicRstStreamFrame& frame) override;
+   void ResetWithError(quic::QuicResetStreamError error) override;
+   void OnClose() override;
+@@ -62,6 +88,26 @@
+   void OnMetadataComplete(size_t frame_len, const quic::QuicHeaderList& header_list) override;
+ 
+ protected:
++  void setWebTransportVisitor(std::unique_ptr<webtransport::SessionVisitor> visitor) override {
++    if (auto* session = web_transport(); session != nullptr) {
++      session->SetVisitor(std::move(visitor));
++    }
++  }
++  webtransport::Session* rawWebTransportSession() override { return web_transport(); }
++  void sendWebTransportDatagram(absl::string_view payload) override;
++  std::shared_ptr<bool> webTransportForwardingGuard() override {
++    if (!webtransport_forwarding_guard_) {
++      webtransport_forwarding_guard_ = std::make_shared<bool>(!webtransport_forwarding_disabled_);
++    }
++    return webtransport_forwarding_guard_;
++  }
++  void disableWebTransportForwarding() override {
++    webtransport_forwarding_disabled_ = true;
++    if (webtransport_forwarding_guard_) { *webtransport_forwarding_guard_ = false; }
++  }
++
++
++
+   // EnvoyQuicStream
+   void switchStreamBlockState() override;
+   uint32_t streamId() override;
+@@ -91,7 +137,14 @@
+   // Makes the QUIC stream use Capsule Protocol. Once this method is called, any calls to encodeData
+   // are expected to contain capsules which will be sent along as HTTP Datagrams. Also, the stream
+   // starts to receive HTTP/3 Datagrams and decode into Capsules.
+-  void useCapsuleProtocol();
++  // Returns true if the capsule protocol handler was installed. Returns false (without installing
++  // anything) if a datagram visitor is already registered on the stream (e.g. by the WebTransport
++  // session of QUICHE), since registering a second one would be a QUIC_BUG.
++  bool useCapsuleProtocol();
++
++  // If the headers indicate this is a WebTransport session, initialize the WebTransportSessionState
++  // in the upstream filter state so the session can be bridged to the downstream one.
++  bool mayInitializeWebTransportState(uint64_t status_code);
+ #endif
+ 
+   // Returns nullptr if the response decoder has already been destructed.
+@@ -105,7 +158,17 @@
+ 
+   // When an HTTP Upgrade is requested, this contains the protocol upgrade type, e.g. "websocket".
+   // It will be empty, when no such request is active.
++  bool webtransport_forwarding_disabled_{false};
++  std::shared_ptr<bool> webtransport_forwarding_guard_;
+   std::string upgrade_protocol_;
++
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  // Set when a WebTransport CONNECT request is buffered in encodeHeaders() awaiting the peer's
++  // HTTP/3 SETTINGS frame. Holds a copy of the request headers until flushPendingHeaders() replays
++  // encodeHeaders() (or OnClose drops it). Null whenever no such request is pending.
++  Http::RequestHeaderMapPtr pending_webtransport_headers_;
++  bool pending_webtransport_end_stream_{false};
++#endif
+ };
+ 
+ } // namespace Quic
+--- a/source/common/quic/envoy_quic_server_session.cc
++++ b/source/common/quic/envoy_quic_server_session.cc
+@@ -1,3 +1,4 @@
++#include "quiche/quic/core/http/quic_server_initiated_spdy_stream.h"
+ #include "source/common/quic/envoy_quic_server_session.h"
+ 
+ #include <iterator>
+@@ -11,6 +12,7 @@
+ #include "source/common/quic/envoy_quic_proof_source.h"
+ #include "source/common/quic/envoy_quic_server_stream.h"
+ #include "source/common/quic/quic_filter_manager_connection_impl.h"
++#include "source/common/runtime/runtime_features.h"
+ 
+ #include "absl/types/optional.h"
+ 
+@@ -69,6 +71,21 @@
+   QuicFilterManagerConnectionImpl::network_connection_ = nullptr;
+ }
+ 
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++quic::WebTransportHttp3VersionSet
++EnvoyQuicServerSession::LocallySupportedWebTransportVersions() const {
++  if (!Runtime::runtimeFeatureEnabled("envoy.reloadable_features.quic_support_web_transport")) {
++    return {};
++  }
++  if (!http3_options_.has_value() || !http3_options_->allow_extended_connect()) {
++    // WebTransport requires extended CONNECT, so only advertise it when extended CONNECT is
++    // enabled.
++    return {};
++  }
++  return quic::kDefaultSupportedWebTransportVersions;
++}
++#endif
++
+ absl::string_view EnvoyQuicServerSession::requestedServerName() const {
+   return {GetCryptoStream()->crypto_negotiated_params().sni};
+ }
+@@ -101,6 +118,17 @@
+   if (aboveHighWatermark()) {
+     stream->runHighWatermarkCallbacks();
+   }
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  // On a WebTransport-capable session an incoming bidirectional stream may turn out to be a
++  // WebTransport data stream (first frame WEBTRANSPORT_STREAM) rather than an HTTP request. Defer
++  // setting up the request decoder until real request headers arrive
++  // (EnvoyQuicServerStream::OnInitialHeadersComplete); data streams never reach there and so never
++  // become HCM streams, which would otherwise dangle during connection teardown. Non-WebTransport
++  // sessions keep the original eager behavior.
++  if (SupportsWebTransport()) {
++    return stream;
++  }
++#endif
+   setUpRequestDecoder(*stream);
+   return stream;
+ }
+@@ -112,7 +140,15 @@
+ }
+ 
+ quic::QuicSpdyStream* EnvoyQuicServerSession::CreateOutgoingBidirectionalStream() {
+-  IS_ENVOY_BUG("Unexpected disallowed server initiated stream");
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  if (SupportsWebTransport() && CanOpenNextOutgoingBidirectionalStream()) {
++    auto stream = std::make_unique<quic::QuicServerInitiatedSpdyStream>(
++        GetNextOutgoingBidirectionalStreamId(), this, quic::BIDIRECTIONAL);
++    auto* result = stream.get();
++    ActivateStream(std::move(stream));
++    return result;
++  }
++#endif
+   return nullptr;
+ }
+ 
+@@ -143,6 +179,11 @@
+ }
+ 
+ void EnvoyQuicServerSession::Initialize() {
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.quic_support_web_transport")) {
++    config()->SetReliableStreamReset(true);
++  }
++#endif
+   quic::QuicServerSessionBase::Initialize();
+   initialized_ = true;
+   quic_connection_->setEnvoyConnection(*this, *this);
+--- a/source/common/quic/envoy_quic_server_session.h
++++ b/source/common/quic/envoy_quic_server_session.h
+@@ -123,6 +123,12 @@
+   void setHttp3Options(const envoy::config::core::v3::Http3ProtocolOptions& http3_options) override;
+   using quic::QuicSession::PerformActionOnActiveStreams;
+ 
++  // Associates the stream with an HTTP request decoder (creates the HCM stream). For WebTransport
++  // sessions this is deferred from CreateIncomingStream() until real request headers arrive, so a
++  // WebTransport data stream (whose first frame is WEBTRANSPORT_STREAM, not HEADERS) never becomes
++  // an HCM stream. Called by EnvoyQuicServerStream::OnInitialHeadersComplete().
++  void setUpRequestDecoder(EnvoyQuicServerStream& stream);
++
+ protected:
+   // quic::QuicServerSessionBase
+   std::unique_ptr<quic::QuicCryptoServerStreamBase>
+@@ -138,6 +144,10 @@
+ 
+   quic::HttpDatagramSupport LocalHttpDatagramSupport() override { return http_datagram_support_; }
+ 
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  quic::WebTransportHttp3VersionSet LocallySupportedWebTransportVersions() const override;
++#endif
++
+   // QuicFilterManagerConnectionImpl
+   bool hasDataToWrite() override;
+   // Used by base class to access quic connection after initialization.
+@@ -145,7 +155,6 @@
+   quic::QuicConnection* quicConnection() override;
+ 
+ private:
+-  void setUpRequestDecoder(EnvoyQuicServerStream& stream);
+ 
+   std::unique_ptr<EnvoyQuicServerConnection> quic_connection_;
+   // These callbacks are owned by network filters and quic session should out live
+--- a/source/common/quic/envoy_quic_server_stream.cc
++++ b/source/common/quic/envoy_quic_server_stream.cc
+@@ -18,6 +18,9 @@
+ 
+ #include "quiche/common/http/http_header_block.h"
+ #include "quiche/quic/core/http/quic_header_list.h"
++#include "quiche/quic/core/quic_data_writer.h"
++#include "quiche/common/quiche_mem_slice.h"
++#include "quiche/common/simple_buffer_allocator.h"
+ #include "quiche/quic/core/quic_session.h"
+ #include "quiche/quic/core/quic_types.h"
+ #include "quiche_platform_impl/quiche_mem_slice_impl.h"
+@@ -89,6 +92,14 @@
+     size_t bytes_sent = WriteHeaders(std::move(header_block), end_stream, nullptr);
+     stats_gatherer_->addBytesSent(bytes_sent, end_stream);
+     ENVOY_BUG(bytes_sent != 0, "Failed to encode headers.");
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++    // The custom server codec also owns the WebTransport acceptance boundary.
++    // Only a successfully written 2xx CONNECT may enable stream-credit wakeups.
++    const uint64_t status = Http::Utility::getResponseStatusOrNullopt(*header_map).value_or(0);
++    if (bytes_sent != 0 && web_transport() != nullptr && status >= 200 && status < 300) {
++      web_transport()->HeadersReceived(envoyHeadersToHttp2HeaderBlock(*header_map));
++    }
++#endif
+   }
+ 
+   if (local_end_stream_) {
+@@ -161,6 +172,18 @@
+   if (read_side_closed()) {
+     return;
+   }
++
++  // Receiving request HEADERS confirms this bidirectional stream is an HTTP request (a WebTransport
++  // data stream is signalled by a WEBTRANSPORT_STREAM frame and never reaches here). Lazily set up
++  // the request decoder / HCM stream if the session deferred it at stream creation (see
++  // EnvoyQuicServerSession::CreateIncomingStream). This must happen *before* the base call below:
++  // QuicSpdyServerStreamBase::OnInitialHeadersComplete validates the headers and resets the stream
++  // on failure, so deferring setup past it would leave rejected requests without an HCM stream and
++  // thus without an access log.
++  if (request_decoder_ == nullptr) {
++    static_cast<EnvoyQuicServerSession*>(session())->setUpRequestDecoder(*this);
++  }
++
+   quic::QuicSpdyServerStreamBase::OnInitialHeadersComplete(fin, frame_len, header_list);
+   if (read_side_closed()) {
+     return;
+@@ -227,7 +250,7 @@
+   }
+ #endif
+ 
+-  Http::RequestDecoder* decoder = request_decoder_->get().ptr();
++  Http::RequestDecoder* decoder = requestDecoderOrNull();
+   if (end_stream && Runtime::runtimeFeatureEnabled(
+                         "envoy.reloadable_features.quic_validate_headers_only_content_length")) {
+     updateReceivedContentBytes(0, true);
+@@ -251,6 +274,9 @@
+ }
+ 
+ void EnvoyQuicServerStream::OnBodyAvailable() {
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  if (resetIfWebTransport("body")) { return; }
++#endif
+   ASSERT(FinishedReadingHeaders());
+   if (read_side_closed()) {
+     return;
+@@ -285,7 +311,7 @@
+       // A stream error has occurred, stop processing.
+       return;
+     }
+-    Http::RequestDecoder* decoder = request_decoder_->get().ptr();
++    Http::RequestDecoder* decoder = requestDecoderOrNull();
+     if (decoder != nullptr) {
+       decoder->decodeData(*buffer, fin_read_and_no_trailers);
+     }
+@@ -325,6 +351,11 @@
+ 
+ void EnvoyQuicServerStream::maybeDecodeTrailers() {
+   if (sequencer()->IsClosed() && !FinishedReadingTrailers()) {
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++    if (resetIfWebTransport("trailers")) {
++      return;
++    }
++#endif
+     // Only decode trailers after finishing decoding body.
+     end_stream_decoded_ = true;
+     updateReceivedContentBytes(0, true);
+@@ -341,7 +372,7 @@
+       onStreamError(close_connection_upon_invalid_header_, rst);
+       return;
+     }
+-    Http::RequestDecoder* decoder = request_decoder_->get().ptr();
++    Http::RequestDecoder* decoder = requestDecoderOrNull();
+     if (decoder != nullptr) {
+       decoder->decodeTrailers(std::move(trailers));
+     }
+@@ -354,6 +385,15 @@
+   ENVOY_STREAM_LOG(debug, "received STOP_SENDING with reset code={}", *this,
+                    static_cast<int>(error.internal_code()));
+   stats_.rx_reset_.inc();
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  if (web_transport_stream() != nullptr) {
++    // Unlike an HTTP response, a WebTransport child has independent read and
++    // write directions. STOP_SENDING must not stop forwarding the opposite
++    // direction, whose application may need to observe the peer's error.
++    SendBufferMonitor::ScopedWatermarkBufferUpdater updater(this, this);
++    return quic::QuicSpdyServerStreamBase::OnStopSending(error);
++  }
++#endif
+   bool end_stream_encoded = local_end_stream_;
+   // This call will close write.
+   if (!quic::QuicSpdyServerStreamBase::OnStopSending(error)) {
+@@ -407,6 +447,8 @@
+ 
+ void EnvoyQuicServerStream::OnConnectionClosed(const quic::QuicConnectionCloseFrame& frame,
+                                                quic::ConnectionCloseSource source) {
++  // Stop child forwarding before QUICHE walks streams during connection teardown.
++  disableWebTransportForwarding();
+   // Run reset callback before closing the stream so that the watermark change will not trigger
+   // callbacks.
+   if (!local_end_stream_) {
+@@ -437,6 +479,16 @@
+ }
+ 
+ void EnvoyQuicServerStream::OnClose() {
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  if (web_transport() != nullptr && !local_end_stream_) {
++    // Session capsules bypass the HTTP encoder/decoder. Remove the HCM stream
++    // while its response encoder is still alive, rather than retaining it until
++    // the whole QUIC connection closes. This also cancels policy recheck timers.
++    disableWebTransportForwarding();
++    runResetCallbacks(Http::StreamResetReason::RemoteReset,
++                      "openzta_webtransport_connect_closed");
++  }
++#endif
+   destroy();
+   quic::QuicSpdyServerStreamBase::OnClose();
+   if (isDoingWatermarkAccounting()) {
+@@ -518,8 +560,13 @@
+     onStreamError(true, quic::QUIC_HEADERS_TOO_LARGE);
+     return;
+   }
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  if (resetIfWebTransport("metadata")) {
++    return;
++  }
++#endif
+   if (!header_list.empty()) {
+-    Http::RequestDecoder* decoder = request_decoder_->get().ptr();
++    Http::RequestDecoder* decoder = requestDecoderOrNull();
+     if (decoder != nullptr) {
+       decoder->decodeMetadata(metadataMapFromHeaderList(header_list));
+     }
+@@ -563,7 +610,8 @@
+ }
+ 
+ #ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
+-void EnvoyQuicServerStream::useCapsuleProtocol() {
++bool EnvoyQuicServerStream::useCapsuleProtocol() {
++  if (uses_capsules()) { return false; }
+   http_datagram_handler_ = std::make_unique<HttpDatagramHandler>(*this);
+   if (request_decoder_ && request_decoder_->get().has_value()) {
+     std::shared_ptr<Http::RequestDecoderHandle> handle =
+@@ -576,7 +624,28 @@
+     });
+   }
+   RegisterHttp3DatagramVisitor(http_datagram_handler_.get());
+-}
++  return true;
++}
++
++bool EnvoyQuicServerStream::resetIfWebTransport(absl::string_view frame_type) {
++  if (web_transport() == nullptr) {
++    return false;
++  }
++  // A WebTransport CONNECT stream is header-only at the HTTP layer: after the extended-CONNECT
++  // HEADERS it carries only WebTransport capsules/data, never HTTP body, trailers, or METADATA.
++  // QUICHE does not reject these, so a peer that sends them is violating the protocol. Reset just
++  // this stream rather than letting the frame be proxied upstream (which, written out of order
++  // ahead of the upstream HEADERS, would escalate to a connection-level H3_FRAME_UNEXPECTED on the
++  // upstream connection). DATA is normally consumed by capsule parser of QUICHE and never reaches
++  // OnBodyAvailable, but it is covered here defensively.
++  ENVOY_STREAM_LOG(debug,
++                   "Resetting WebTransport stream: {} is not allowed on a WebTransport CONNECT "
++                   "stream.",
++                   *this, frame_type);
++  Reset(quic::QUIC_BAD_APPLICATION_PAYLOAD);
++  return true;
++}
++
+ #endif
+ 
+ void EnvoyQuicServerStream::OnInvalidHeaders() { onStreamError(absl::nullopt); }
+@@ -592,5 +661,34 @@
+   }
+ }
+ 
++void EnvoyQuicServerStream::ConvertToWebTransportDataStream(
++    quic::WebTransportSessionId session_id) {
++  if (!session()->connection()->connected() || write_side_closed()) { return; }
++  SendBufferMonitor::ScopedWatermarkBufferUpdater updater(this, this);
++  quic::QuicSpdyServerStreamBase::ConvertToWebTransportDataStream(session_id);
++}
++
++void EnvoyQuicServerStream::WriteOrBufferBody(absl::string_view data, bool fin) {
++  // QUICHE can generate a close capsule from a paired session callback while
++  // this connection is already being torn down. No stream write is legal then.
++  if (!session()->connection()->connected() || write_side_closed()) { return; }
++  SendBufferMonitor::ScopedWatermarkBufferUpdater updater(this, this);
++  quic::QuicSpdyServerStreamBase::WriteOrBufferBody(data, fin);
++}
++
++void EnvoyQuicServerStream::sendWebTransportDatagram(absl::string_view payload) {
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  if (web_transport() == nullptr || !session()->connection()->connected() || write_side_closed() ||
++      payload.size() > GetMaxDatagramSize()) { return; }
++  const uint64_t quarter_id = id() / 4;
++  const size_t size = quic::QuicDataWriter::GetVarInt62Len(quarter_id) + payload.size();
++  quiche::QuicheBuffer buffer(quiche::SimpleBufferAllocator::Get(), size);
++  quic::QuicDataWriter writer(size, buffer.data());
++  if (!writer.WriteVarInt62(quarter_id) || !writer.WriteBytes(payload.data(), payload.size())) { return; }
++  quiche::QuicheMemSlice slice(std::move(buffer));
++  session()->SendDatagram(absl::Span<quiche::QuicheMemSlice>(&slice, 1), true);
++#endif
++}
++
+ } // namespace Quic
+ } // namespace Envoy
+--- a/source/common/quic/envoy_quic_server_stream.h
++++ b/source/common/quic/envoy_quic_server_stream.h
+@@ -8,6 +8,7 @@
+ 
+ #include "quiche/common/platform/api/quiche_reference_counted.h"
+ #include "quiche/quic/core/http/quic_spdy_server_stream_base.h"
++#include "quiche/quic/core/http/web_transport_http3.h"
+ #include "quiche/quic/core/qpack/qpack_encoder.h"
+ #include "quiche/quic/core/qpack/qpack_instruction_encoder.h"
+ 
+@@ -18,7 +19,8 @@
+ class EnvoyQuicServerStream : public quic::QuicSpdyServerStreamBase,
+                               public EnvoyQuicStream,
+                               public Http::ResponseEncoder,
+-                              public quic::QuicSpdyStream::MetadataVisitor {
++                              public quic::QuicSpdyStream::MetadataVisitor,
++                              public Http::WebTransportSession {
+ public:
+   EnvoyQuicServerStream(quic::QuicStreamId id, quic::QuicSpdySession* session,
+                         quic::StreamType type, Http::Http3::CodecStats& stats,
+@@ -63,12 +65,27 @@
+   // Http::Stream
+   void resetStream(Http::StreamResetReason reason) override;
+   absl::optional<uint32_t> codecStreamId() const override { return id(); }
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++  // Exposes the downstream WebTransport session (created by QUICHE for a negotiated WebTransport
++  // CONNECT) so the upstream codec can bridge it to the upstream session. See
++  // Http::StreamDecoderFilterCallbacks::webTransportSession().
++  OptRef<Http::WebTransportSession> webTransportSession() override {
++    if (auto* session = web_transport(); session != nullptr) {
++      return *this;
++    }
++    return {};
++  }
++#endif
+ 
+   // quic::QuicStream
+   void OnStreamFrame(const quic::QuicStreamFrame& frame) override;
+   void OnSoonToBeDestroyed() override;
+   // quic::QuicSpdyStream
+   void OnBodyAvailable() override;
++  // QUICHE also writes WebTransport prefaces and close capsules directly,
++  // outside the HTTP encoder. Include those bytes in connection watermarks.
++  void ConvertToWebTransportDataStream(quic::WebTransportSessionId session_id) override;
++  void WriteOrBufferBody(absl::string_view data, bool fin) override;
+   bool OnStopSending(quic::QuicResetStreamError error) override;
+   void OnStreamReset(const quic::QuicRstStreamFrame& frame) override;
+   void ResetWithError(quic::QuicResetStreamError error) override;
+@@ -89,6 +106,26 @@
+   void OnMetadataComplete(size_t frame_len, const quic::QuicHeaderList& header_list) override;
+ 
+ protected:
++  void setWebTransportVisitor(std::unique_ptr<webtransport::SessionVisitor> visitor) override {
++    if (auto* session = web_transport(); session != nullptr) {
++      session->SetVisitor(std::move(visitor));
++    }
++  }
++  webtransport::Session* rawWebTransportSession() override { return web_transport(); }
++  void sendWebTransportDatagram(absl::string_view payload) override;
++  std::shared_ptr<bool> webTransportForwardingGuard() override {
++    if (!webtransport_forwarding_guard_) {
++      webtransport_forwarding_guard_ = std::make_shared<bool>(!webtransport_forwarding_disabled_);
++    }
++    return webtransport_forwarding_guard_;
++  }
++  void disableWebTransportForwarding() override {
++    webtransport_forwarding_disabled_ = true;
++    if (webtransport_forwarding_guard_) { *webtransport_forwarding_guard_ = false; }
++  }
++
++
++
+   // EnvoyQuicStream
+   void switchStreamBlockState() override;
+   uint32_t streamId() override;
+@@ -120,9 +157,29 @@
+   // Makes the QUIC stream use Capsule Protocol. Once this method is called, any calls to encodeData
+   // are expected to contain capsules which will be sent along as HTTP Datagrams. Also, the stream
+   // starts to receive HTTP/3 Datagrams and decode into Capsules.
+-  void useCapsuleProtocol();
++  // Returns true if the capsule protocol handler was installed. Returns false (without installing
++  // anything) if a datagram visitor is already registered on the stream (e.g. by the WebTransport
++  // session of QUICHE), since registering a second one would be a QUIC_BUG.
++  bool useCapsuleProtocol();
++
++  // A WebTransport CONNECT stream carries only the extended-CONNECT HEADERS and then WebTransport
++  // capsules/data; HTTP request body, trailers, and METADATA are not part of WebTransport and
++  // QUICHE does not reject them on such a stream. If this is a WebTransport stream (web_transport()
++  // is non-null), reset just this stream (its WebTransport session) so the offending frame is never
++  // proxied upstream, and return true so the caller stops processing. Returns false for non-
++  // WebTransport streams, which proceed normally. @param frame_type names the frame for logging.
++  bool resetIfWebTransport(absl::string_view frame_type);
+ #endif
+ 
++  // Returns the request decoder, or nullptr if one has not been set up yet. The decoder is created
++  // lazily once request headers arrive, so a WebTransport data stream (which never receives
++  // headers) has no decoder; callers must tolerate nullptr.
++  Http::RequestDecoder* requestDecoderOrNull() {
++    return request_decoder_ == nullptr ? nullptr : request_decoder_->get().ptr();
++  }
++
++  bool webtransport_forwarding_disabled_{false};
++  std::shared_ptr<bool> webtransport_forwarding_guard_;
+   Http::RequestDecoderHandlePtr request_decoder_;
+   envoy::config::core::v3::HttpProtocolOptions::HeadersWithUnderscoresAction
+       headers_with_underscores_action_;
+--- a/source/common/quic/quic_client_transport_socket_factory.cc
++++ b/source/common/quic/quic_client_transport_socket_factory.cc
+@@ -1,6 +1,7 @@
+ #include "source/common/quic/quic_client_transport_socket_factory.h"
+ 
+ #include <memory>
++#include <vector>
+ 
+ #include "envoy/extensions/transport_sockets/quic/v3/quic_transport.pb.validate.h"
+ 
+@@ -8,11 +9,72 @@
+ #include "source/common/quic/envoy_quic_proof_verifier.h"
+ #include "source/common/runtime/runtime_features.h"
+ #include "source/common/tls/context_config_impl.h"
++#include "source/common/tls/context_impl.h"
++
++#include "openssl/pool.h"
++#include "openssl/x509.h"
+ 
+ #include "quiche/quic/core/crypto/quic_client_session_cache.h"
+ 
+ namespace Envoy {
+ namespace Quic {
++namespace {
++// QUICHE owns a separate TLS-with-buffers context. Copy only the configured service identity
++// into it; the end user's downstream certificate must never be used upstream.
++absl::Status configureClientIdentity(const Ssl::ClientContextSharedPtr& context,
++                                     SSL_CTX* quic_ctx) {
++  auto* tls_context = dynamic_cast<Extensions::TransportSockets::Tls::ContextImpl*>(context.get());
++  if (tls_context == nullptr) {
++    return absl::InvalidArgumentError("QUIC client identity requires an Envoy TLS context");
++  }
++  const Network::TransportSocketOptionsConstSharedPtr options;
++  auto ssl = tls_context->newSsl(options, nullptr);
++  RETURN_IF_NOT_OK(ssl.status());
++  X509* leaf = SSL_get_certificate(ssl->get());
++  EVP_PKEY* key = SSL_get_privatekey(ssl->get());
++  if (leaf == nullptr || key == nullptr) {
++    return absl::InvalidArgumentError(
++        "QUIC client service certificate or software key unavailable");
++  }
++  std::vector<bssl::UniquePtr<CRYPTO_BUFFER>> owned_chain;
++  std::vector<CRYPTO_BUFFER*> chain;
++  auto append = [&](X509* certificate) -> bool {
++    const int length = i2d_X509(certificate, nullptr);
++    if (length <= 0) {
++      return false;
++    }
++    std::vector<uint8_t> der(length);
++    unsigned char* cursor = der.data();
++    if (i2d_X509(certificate, &cursor) != length) {
++      return false;
++    }
++    bssl::UniquePtr<CRYPTO_BUFFER> buffer(CRYPTO_BUFFER_new(der.data(), der.size(), nullptr));
++    if (buffer == nullptr) {
++      return false;
++    }
++    chain.push_back(buffer.get());
++    owned_chain.push_back(std::move(buffer));
++    return true;
++  };
++  if (!append(leaf)) {
++    return absl::InvalidArgumentError("QUIC service certificate encoding failed");
++  }
++  STACK_OF(X509)* extra_chain = nullptr;
++  SSL_get0_chain_certs(ssl->get(), &extra_chain);
++  for (size_t i = 0; i < sk_X509_num(extra_chain); ++i) {
++    if (!append(sk_X509_value(extra_chain, i))) {
++      return absl::InvalidArgumentError("QUIC service certificate chain encoding failed");
++    }
++  }
++  // BoringSSL retains references. No private key bytes are serialized or exported.
++  if (SSL_CTX_set_chain_and_key(quic_ctx, chain.data(), chain.size(), key, nullptr) != 1) {
++    return absl::InvalidArgumentError("QUIC service identity installation failed");
++  }
++  SSL_CTX_set_early_data_enabled(quic_ctx, 0);
++  SSL_CTX_set_session_cache_mode(quic_ctx, SSL_SESS_CACHE_OFF);
++  return absl::OkStatus();
++}
++} // namespace
+ 
+ absl::StatusOr<std::unique_ptr<QuicClientTransportSocketFactory>>
+ QuicClientTransportSocketFactory::create(
+@@ -84,12 +146,28 @@
+             envoy::extensions::transport_sockets::tls::v3::CertificateValidationContext::
+                 ACCEPT_UNTRUSTED;
+     // If the context has been updated, update the crypto config.
++    const bool has_client_identity =
++        clientContextConfig() && !clientContextConfig()->tlsCertificates().empty();
++    std::shared_ptr<quic::SessionCache> session_cache;
++    if (!has_client_identity) {
++      session_cache = std::make_shared<quic::QuicClientSessionCache>();
++    }
++    auto crypto_config = std::make_shared<quic::QuicCryptoClientConfig>(
++        std::make_unique<Quic::EnvoyQuicProofVerifier>(Envoy::Ssl::ClientContextSharedPtr(context),
++                                                       accept_untrusted),
++        std::move(session_cache));
++
++    if (has_client_identity) {
++      const auto identity_status = configureClientIdentity(context, crypto_config->ssl_ctx());
++      if (!identity_status.ok()) {
++        ENVOY_LOG(error, "QUIC client service identity unavailable: {}", identity_status.message());
++        return nullptr;
++      }
++    }
++    CertCompression::registerSslContext(crypto_config->ssl_ctx());
++    // Publish only after the complete identity is installed. Failed SDS updates fail closed.
+     tls_config.client_context_ = context;
+-    tls_config.crypto_config_ = std::make_shared<quic::QuicCryptoClientConfig>(
+-        std::make_unique<Quic::EnvoyQuicProofVerifier>(std::move(context), accept_untrusted),
+-        std::make_unique<quic::QuicClientSessionCache>());
+-
+-    CertCompression::registerSslContext(tls_config.crypto_config_->ssl_ctx());
++    tls_config.crypto_config_ = std::move(crypto_config);
+   }
+   // Return the latest crypto config.
+   return tls_config.crypto_config_;
+--- a/source/common/quic/send_buffer_monitor.cc
++++ b/source/common/quic/send_buffer_monitor.cc
+@@ -9,11 +9,19 @@
+     quic::QuicStream* quic_stream, SendBufferMonitor* send_buffer_monitor)
+     : quic_stream_(quic_stream), old_buffered_bytes_(quic_stream_->BufferedDataBytes()),
+       send_buffer_monitor_(send_buffer_monitor) {
+-  ASSERT(!send_buffer_monitor_->is_doing_watermark_accounting_);
++  // QUICHE callbacks may synchronously write on the stream that is already
++  // being drained. The outer scope accounts for the entire change.
++  if (send_buffer_monitor_->is_doing_watermark_accounting_) {
++    send_buffer_monitor_ = nullptr;
++    return;
++  }
+   send_buffer_monitor_->is_doing_watermark_accounting_ = true;
+ }
+ 
+ SendBufferMonitor::ScopedWatermarkBufferUpdater::~ScopedWatermarkBufferUpdater() {
++  if (send_buffer_monitor_ == nullptr) {
++    return;
++  }
+   // If quic_stream_ is done writing, regards all buffered bytes, if there is any, as drained.
+   uint64_t new_buffered_bytes =
+       quic_stream_->write_side_closed() ? 0u : quic_stream_->BufferedDataBytes();
+--- /dev/null
++++ b/source/common/quic/web_transport_session_bridge.cc
+@@ -0,0 +1,410 @@
++#include "source/common/quic/web_transport_session_bridge.h"
++
++#include <array>
++
++#include "source/common/quic/send_buffer_monitor.h"
++#include "quiche/quic/core/http/quic_spdy_session.h"
++#include "quiche/quic/core/http/quic_spdy_stream.h"
++
++#include "quiche/common/simple_buffer_allocator.h"
++
++namespace Envoy {
++namespace Quic {
++
++bool WebTransportSessionState::active() const {
++  if (!downstreamAlive() || !upstreamAlive() ||
++      (downstream_allowed && !*downstream_allowed) ||
++      (upstream_allowed && !*upstream_allowed)) {
++    return false;
++  }
++  // A connection is marked closed before QUICHE notifies each stream. A
++  // child callback may run before its parent receives OnConnectionClosed().
++  // Check both connections rather than relying only on parent visitor state.
++  auto* downstream = dynamic_cast<quic::QuicSpdyStream*>(downstream_transport);
++  auto* upstream = dynamic_cast<quic::QuicSpdyStream*>(upstream_transport);
++  return (downstream == nullptr || downstream->spdy_session()->connection()->connected()) &&
++         (upstream == nullptr || upstream->spdy_session()->connection()->connected());
++}
++
++// --- WebTransportStreamBridge ---
++
++WebTransportStreamBridge::WebTransportStreamBridge(webtransport::Stream* local,
++                                                   webtransport::Stream* peer,
++                                                   std::function<bool()> active,
++                                                   quic::QuicSpdySession* local_session,
++                                                   quic::QuicSpdySession* peer_session)
++    : active_(std::move(active)), local_session_(local_session), peer_session_(peer_session),
++      local_(local), peer_(peer) {}
++
++bool WebTransportStreamBridge::transferData(webtransport::Stream* src, webtransport::Stream* dst) {
++  auto keep_alive = shared_from_this();
++  bool& fin_forwarded = src == local_ ? local_fin_forwarded_ : peer_fin_forwarded_;
++  if (fin_forwarded) {
++    return true;
++  }
++  // Move all currently-available data from src to dst. Returns false if dst's write side is
++  // blocked, in which case nothing is read out of src this turn (so no data is lost) and the
++  // transfer resumes when dst's OnCanWrite fires.
++  std::array<char, 16384> buffer;
++  while (local_ != nullptr && peer_ != nullptr && active_()) {
++    // Check that dst can accept a write *before* reading from src. WebTransport has no way to put
++    // bytes back into the stream, so reading before a failed write would drop them.
++    if (!dst->CanWrite()) {
++      return false;
++    }
++
++    const auto source_id = src->GetStreamId();
++    webtransport::Stream::ReadResult result = src->Read(absl::MakeSpan(buffer));
++    // Reading FIN can synchronously tear down a stream visitor. The bridge is held above,
++    // but a stream pointer must not be used again after either parent has closed.
++    if (local_ == nullptr || peer_ == nullptr || !active_()) {
++      return true;
++    }
++    if (result.bytes_read == 0 && !result.fin) {
++      // Nothing more to read right now.
++      return true;
++    }
++    ENVOY_LOG(trace, "WebTransport stream bridge read {} bytes (fin={}) from stream {}",
++              result.bytes_read, result.fin, source_id);
++
++    quiche::StreamWriteOptions options;
++    options.set_send_fin(result.fin);
++    // Raw WebTransport adapters bypass encodeData(). Keep the same scoped
++    // accounting used by the HTTP codecs, including reentrant writes from
++    // OnCanWrite(), so a later buffer drain cannot underflow the connection.
++    auto write = [&](absl::Span<quiche::QuicheMemSlice> slices) {
++      auto* session = dst == local_ ? local_session_ : peer_session_;
++      auto* stream = session != nullptr ? session->GetActiveStream(dst->GetStreamId()) : nullptr;
++      auto* monitor = dynamic_cast<SendBufferMonitor*>(stream);
++      if (monitor != nullptr) {
++        SendBufferMonitor::ScopedWatermarkBufferUpdater accounting(stream, monitor);
++        return dst->Writev(slices, options);
++      }
++      return dst->Writev(slices, options);
++    };
++    absl::Status write_result;
++    if (result.bytes_read > 0) {
++      quiche::QuicheMemSlice slice(
++          quiche::QuicheBuffer::Copy(quiche::SimpleBufferAllocator::Get(),
++                                     absl::string_view(buffer.data(), result.bytes_read)));
++      absl::Span<quiche::QuicheMemSlice> span(&slice, 1);
++      write_result = write(span);
++    } else {
++      // FIN with no data.
++      write_result = write(absl::Span<quiche::QuicheMemSlice>());
++    }
++    if (!write_result.ok()) {
++      // CanWrite() returned true, so this is not flow-control backpressure; treat as terminal for
++      // this direction rather than retrying (which would spin).
++      ENVOY_LOG(debug, "WebTransport stream bridge write failed: {}", write_result.message());
++      if (local_ != nullptr) {
++        local_->ResetDueToInternalError();
++      }
++      if (peer_ != nullptr) {
++        peer_->ResetDueToInternalError();
++      }
++      return true;
++    }
++    ENVOY_LOG(trace, "WebTransport stream bridge wrote {} bytes (fin={})", result.bytes_read,
++              result.fin);
++    if (result.fin) {
++      fin_forwarded = true;
++      // Write side is done; nothing further to forward in this direction.
++      return true;
++    }
++  }
++  return true;
++}
++
++void WebTransportStreamBridge::start() {
++  if (local_ == nullptr || peer_ == nullptr) {
++    return;
++  }
++  // Data may already be buffered on either stream from before SetVisitor() was called; QUICHE does
++  // not replay OnCanRead for it, so pump both directions once now.
++  if (!transferData(local_, peer_)) {
++    local_read_blocked_ = true;
++  }
++  if (local_ != nullptr && peer_ != nullptr && !transferData(peer_, local_)) {
++    peer_read_blocked_ = true;
++  }
++}
++
++// LocalVisitor: reads from local, writes to peer.
++WebTransportStreamBridge::LocalVisitor::~LocalVisitor() { bridge_->local_ = nullptr; }
++
++void WebTransportStreamBridge::LocalVisitor::OnCanRead() {
++  // A forwarding callback may destroy this visitor; retain the bridge on the stack.
++  auto bridge = bridge_;
++  if (bridge->local_ == nullptr || bridge->peer_ == nullptr) {
++    return;
++  }
++  if (!bridge->transferData(bridge->local_, bridge->peer_)) {
++    // Peer write side is full; pause reading local until peer becomes writable (resumed by
++    // PeerVisitor::OnCanWrite).
++    bridge->local_read_blocked_ = true;
++  }
++}
++
++void WebTransportStreamBridge::LocalVisitor::OnCanWrite() {
++  // A forwarding callback may destroy this visitor; retain the bridge on the stack.
++  auto bridge = bridge_;
++  if (bridge->local_ == nullptr || bridge->peer_ == nullptr) {
++    return;
++  }
++  // Local can accept writes again. The peer->local direction may have been paused because the
++  // local write side was full; resume it.
++  if (bridge->peer_read_blocked_) {
++    bridge->peer_read_blocked_ = false;
++    if (!bridge->transferData(bridge->peer_, bridge->local_)) {
++      bridge->peer_read_blocked_ = true;
++    }
++  }
++}
++
++void WebTransportStreamBridge::LocalVisitor::OnResetStreamReceived(
++    webtransport::StreamErrorCode error) {
++  ENVOY_LOG(debug, "WebTransport local stream reset received, code={}", error);
++  if (bridge_->peer_ != nullptr) {
++    bridge_->peer_->ResetWithUserCode(error);
++  }
++}
++
++void WebTransportStreamBridge::LocalVisitor::OnStopSendingReceived(
++    webtransport::StreamErrorCode error) {
++  ENVOY_LOG(debug, "WebTransport local stop sending received, code={}", error);
++  if (bridge_->peer_ != nullptr) {
++    bridge_->peer_->SendStopSending(error);
++  }
++}
++
++// PeerVisitor: reads from peer, writes to local.
++WebTransportStreamBridge::PeerVisitor::~PeerVisitor() { bridge_->peer_ = nullptr; }
++
++void WebTransportStreamBridge::PeerVisitor::OnCanRead() {
++  // A forwarding callback may destroy this visitor; retain the bridge on the stack.
++  auto bridge = bridge_;
++  if (bridge->local_ == nullptr || bridge->peer_ == nullptr) {
++    return;
++  }
++  if (!bridge->transferData(bridge->peer_, bridge->local_)) {
++    // Local write side is full; pause reading peer until local becomes writable (resumed by
++    // LocalVisitor::OnCanWrite).
++    bridge->peer_read_blocked_ = true;
++  }
++}
++
++void WebTransportStreamBridge::PeerVisitor::OnCanWrite() {
++  // A forwarding callback may destroy this visitor; retain the bridge on the stack.
++  auto bridge = bridge_;
++  if (bridge->local_ == nullptr || bridge->peer_ == nullptr) {
++    return;
++  }
++  // Peer can accept writes again. The local->peer direction may have been paused because the peer
++  // write side was full; resume it.
++  if (bridge->local_read_blocked_) {
++    bridge->local_read_blocked_ = false;
++    if (!bridge->transferData(bridge->local_, bridge->peer_)) {
++      bridge->local_read_blocked_ = true;
++    }
++  }
++}
++
++void WebTransportStreamBridge::PeerVisitor::OnResetStreamReceived(
++    webtransport::StreamErrorCode error) {
++  ENVOY_LOG(debug, "WebTransport peer stream reset received, code={}", error);
++  if (bridge_->local_ != nullptr) {
++    bridge_->local_->ResetWithUserCode(error);
++  }
++}
++
++void WebTransportStreamBridge::PeerVisitor::OnStopSendingReceived(
++    webtransport::StreamErrorCode error) {
++  ENVOY_LOG(debug, "WebTransport peer stop sending received, code={}", error);
++  if (bridge_->local_ != nullptr) {
++    bridge_->local_->SendStopSending(error);
++  }
++}
++
++// --- WebTransportSessionBridge ---
++
++WebTransportSessionBridge::WebTransportSessionBridge(
++    WebTransportSessionStateSharedPtr session_state, bool is_downstream)
++    : session_state_(std::move(session_state)), is_downstream_(is_downstream) {}
++
++WebTransportSessionBridge::~WebTransportSessionBridge() {
++  // This side's session is being destroyed; clear its pointer so the peer bridge stops forwarding.
++  clearLocalSession();
++}
++
++void WebTransportSessionBridge::OnSessionReady() {
++  ENVOY_LOG(debug, "WebTransport session bridge: session ready");
++}
++
++void WebTransportSessionBridge::OnSessionClosed(webtransport::SessionErrorCode error_code,
++                                                const std::string& error_message) {
++  if (closed_) {
++    return;
++  }
++  closed_ = true;
++  ENVOY_LOG(debug, "WebTransport session closed, code={}, message={}", error_code, error_message);
++  // The session can be closed (e.g. a CLOSE_WEBTRANSPORT_SESSION capsule or CONNECT-stream FIN was
++  // received) while its object is still alive, i.e. before this visitor is destroyed. Clear this
++  // side now so the peer bridge stops forwarding into the closed session rather than waiting for
++  // the destructor.
++  auto* peer = peerSession();
++  auto* peer_transport =
++      is_downstream_ ? session_state_->upstream_transport : session_state_->downstream_transport;
++  auto* peer_stream = dynamic_cast<quic::QuicSpdyStream*>(peer_transport);
++  const bool peer_writable = peer_stream == nullptr ||
++      (peer_stream->spdy_session()->connection()->connected() && !peer_stream->write_side_closed());
++  clearLocalSession();
++  if (peer != nullptr && peer_writable) {
++    // Closing the paired CONNECT tears down every associated QUICHE data stream.
++    // Shared state is disabled first, including existing stream visitors.
++    peer->CloseSession(error_code, "OpenZTA: paired WebTransport session closed");
++  }
++}
++
++void WebTransportSessionBridge::bridgeIncomingStream(webtransport::Stream* local_stream,
++                                                     webtransport::Stream* peer_stream) {
++  if (!local_stream || !peer_stream) {
++    ENVOY_LOG(warn, "WebTransport bridge: failed to create stream pair");
++    if (local_stream) {
++      local_stream->ResetWithUserCode(0);
++    }
++    return;
++  }
++  auto state = session_state_;
++  auto* local_transport = is_downstream_ ? state->downstream_transport : state->upstream_transport;
++  auto* peer_transport = is_downstream_ ? state->upstream_transport : state->downstream_transport;
++  auto* local_connect = dynamic_cast<quic::QuicSpdyStream*>(local_transport);
++  auto* peer_connect = dynamic_cast<quic::QuicSpdyStream*>(peer_transport);
++  auto bridge = std::make_shared<WebTransportStreamBridge>(
++      local_stream, peer_stream, [state]() { return state->active(); },
++      local_connect != nullptr ? local_connect->spdy_session() : nullptr,
++      peer_connect != nullptr ? peer_connect->spdy_session() : nullptr);
++  // The two visitors co-own the bridge (each holds a shared_ptr) and are owned by their streams via
++  // SetVisitor, so the bridge lives as long as either stream and is freed once both close. No
++  // separate ownership by the session bridge is needed.
++  local_stream->SetVisitor(bridge->makeLocalVisitor());
++  peer_stream->SetVisitor(bridge->makePeerVisitor());
++  // Drain any data that arrived before the visitors were installed (QUICHE does not replay
++  // OnCanRead for it).
++  bridge->start();
++}
++
++void WebTransportSessionBridge::OnIncomingBidirectionalStreamAvailable() {
++  if (!session_state_->active() || closed_) {
++    ENVOY_LOG(debug, "WebTransport session bridge: ignoring incoming stream because peer is dead");
++    return;
++  }
++
++  // Stream callbacks may synchronously close either parent session and destroy this visitor.
++  // Keep the shared liveness state on the stack and stop before touching this again.
++  auto state = session_state_;
++  while (state->active() && peerSession()->CanOpenNextOutgoingBidirectionalStream()) {
++    webtransport::Stream* local_stream = localSession()->AcceptIncomingBidirectionalStream();
++    if (!local_stream) {
++      break;
++    }
++    webtransport::Stream* peer_stream = peerSession()->OpenOutgoingBidirectionalStream();
++    bridgeIncomingStream(local_stream, peer_stream);
++  }
++}
++
++void WebTransportSessionBridge::OnIncomingUnidirectionalStreamAvailable() {
++  if (!session_state_->active() || closed_) {
++    ENVOY_LOG(debug, "WebTransport session bridge: ignoring incoming stream because peer is dead");
++    return;
++  }
++
++  // Stream callbacks may synchronously close either parent session and destroy this visitor.
++  // Keep the shared liveness state on the stack and stop before touching this again.
++  auto state = session_state_;
++  while (state->active() && peerSession()->CanOpenNextOutgoingUnidirectionalStream()) {
++    webtransport::Stream* local_stream = localSession()->AcceptIncomingUnidirectionalStream();
++    if (!local_stream) {
++      break;
++    }
++    webtransport::Stream* peer_stream = peerSession()->OpenOutgoingUnidirectionalStream();
++    bridgeIncomingStream(local_stream, peer_stream);
++  }
++}
++
++void WebTransportSessionBridge::OnDatagramReceived(absl::string_view datagram) {
++  if (!session_state_->active() || closed_) {
++    ENVOY_LOG(debug,
++              "WebTransport session bridge: ignoring incoming datagram because peer is dead");
++    return;
++  }
++
++  auto* transport =
++      is_downstream_ ? session_state_->upstream_transport : session_state_->downstream_transport;
++  if (transport != nullptr) {
++    transport->sendWebTransportDatagram(datagram);
++  }
++}
++
++void WebTransportSessionBridge::OnCanCreateNewOutgoingBidirectionalStream() {
++  auto* peer = is_downstream_ ? session_state_->upstream_bridge : session_state_->downstream_bridge;
++  if (peer != nullptr && session_state_->active()) {
++    peer->OnIncomingBidirectionalStreamAvailable();
++  }
++}
++
++void WebTransportSessionBridge::OnCanCreateNewOutgoingUnidirectionalStream() {
++  auto* peer = is_downstream_ ? session_state_->upstream_bridge : session_state_->downstream_bridge;
++  if (peer != nullptr && session_state_->active()) {
++    peer->OnIncomingUnidirectionalStreamAvailable();
++  }
++}
++
++// static
++void WebTransportSessionBridge::installBridge(Http::WebTransportSession& downstream_session,
++                                              Http::WebTransportSession& upstream_session) {
++  // Both underlying QUICHE sessions must be present to bridge them (defensive: the caller only
++  // invokes this once both are known, see EnvoyQuicClientStream::mayInitializeWebTransportState).
++  webtransport::Session* downstream_raw = downstream_session.rawWebTransportSession();
++  webtransport::Session* upstream_raw = upstream_session.rawWebTransportSession();
++  if (downstream_raw == nullptr || upstream_raw == nullptr) {
++    return;
++  }
++  // The two bridges created below co-own this state, so it outlives installBridge. Store the
++  // sessions as the webtransport::Session interface so each bridge can forward to the other.
++  auto session_state = std::make_shared<WebTransportSessionState>();
++  session_state->setDownstreamSession(downstream_raw);
++  session_state->setUpstreamSession(upstream_raw);
++  session_state->downstream_transport = &downstream_session;
++  session_state->upstream_transport = &upstream_session;
++  session_state->downstream_allowed = downstream_session.webTransportForwardingGuard();
++  session_state->upstream_allowed = upstream_session.webTransportForwardingGuard();
++  if (!session_state->active()) {
++    upstream_raw->CloseSession(0, "OpenZTA: WebTransport authorization ended");
++    return;
++  }
++
++  auto ds_bridge = std::make_unique<WebTransportSessionBridge>(session_state, true);
++  auto us_bridge = std::make_unique<WebTransportSessionBridge>(session_state, false);
++  session_state->downstream_bridge = ds_bridge.get();
++  session_state->upstream_bridge = us_bridge.get();
++  // Transfer ownership to the sessions via setWebTransportVisitor (which wraps the concrete
++  // WebTransportHttp3::SetVisitor; the interface decouples installBridge from the concrete type).
++  downstream_session.setWebTransportVisitor(std::move(ds_bridge));
++  upstream_session.setWebTransportVisitor(std::move(us_bridge));
++  // QUICHE may have associated streams before upstream authorization completed.
++  // No forwarding was installed then. Drain only once both sessions are paired.
++  session_state->downstream_bridge->OnIncomingBidirectionalStreamAvailable();
++  if (session_state->active() && session_state->downstream_bridge != nullptr) {
++    session_state->downstream_bridge->OnIncomingUnidirectionalStreamAvailable();
++  }
++  if (session_state->active() && session_state->upstream_bridge != nullptr) {
++    session_state->upstream_bridge->OnIncomingBidirectionalStreamAvailable();
++  }
++  if (session_state->active() && session_state->upstream_bridge != nullptr) {
++    session_state->upstream_bridge->OnIncomingUnidirectionalStreamAvailable();
++  }
++}
++
++} // namespace Quic
++} // namespace Envoy
+--- /dev/null
++++ b/source/common/quic/web_transport_session_bridge.h
+@@ -0,0 +1,227 @@
++#pragma once
++
++#include <memory>
++#include <functional>
++#include <vector>
++
++#include "envoy/http/codec.h"
++
++#include "source/common/common/logger.h"
++
++#include "quiche/web_transport/web_transport.h"
++
++namespace quic { class QuicSpdySession; }
++
++namespace Envoy {
++namespace Quic {
++
++/**
++ * Bridges a single WebTransport stream between downstream and upstream.
++ * Reads data from one side and writes to the other, handling backpressure.
++ */
++// The two streams are named "local" and "peer" rather than "downstream"/"upstream" because a
++// single stream bridge is symmetric: at the session level it pairs a stream accepted on one
++// session with a stream opened on the other, and which of those is the proxy's downstream vs
++// upstream depends on which session created the bridge (see WebTransportSessionBridge).
++// The visitors below are owned by the QUIC streams (via Stream::SetVisitor). The bridge is
++// reference-counted and co-owned by its two visitors (each holds a shared_ptr to it), so it lives
++// as long as at least one of its streams and is freed once both are gone. During connection
++// teardown one side's stream/adapter can be destroyed before the other's; when a visitor is
++// destroyed (its stream is gone) it nulls the corresponding stream pointer on the bridge, so the
++// surviving visitor never dereferences a freed peer.
++class WebTransportStreamBridge : protected Logger::Loggable<Logger::Id::quic_stream>,
++                                 public std::enable_shared_from_this<WebTransportStreamBridge> {
++public:
++  WebTransportStreamBridge(
++      webtransport::Stream* local, webtransport::Stream* peer,
++      std::function<bool()> active = []() { return true; },
++      quic::QuicSpdySession* local_session = nullptr,
++      quic::QuicSpdySession* peer_session = nullptr);
++  ~WebTransportStreamBridge() = default;
++
++  /**
++   * Visitor installed on the local stream. Forwards data local->peer.
++   */
++  class LocalVisitor : public webtransport::StreamVisitor {
++  public:
++    explicit LocalVisitor(std::shared_ptr<WebTransportStreamBridge> bridge)
++        : bridge_(std::move(bridge)) {}
++    // The local stream (and its adapter) is being destroyed; drop the now-dangling pointer so the
++    // peer's visitor never dereferences it.
++    ~LocalVisitor() override;
++
++    void OnCanRead() override;
++    void OnCanWrite() override;
++    void OnResetStreamReceived(webtransport::StreamErrorCode error) override;
++    void OnStopSendingReceived(webtransport::StreamErrorCode error) override;
++    void OnWriteSideInDataRecvdState() override {}
++
++  private:
++    std::shared_ptr<WebTransportStreamBridge> bridge_;
++  };
++
++  /**
++   * Visitor installed on the peer stream. Forwards data peer->local.
++   */
++  class PeerVisitor : public webtransport::StreamVisitor {
++  public:
++    explicit PeerVisitor(std::shared_ptr<WebTransportStreamBridge> bridge)
++        : bridge_(std::move(bridge)) {}
++    ~PeerVisitor() override;
++
++    void OnCanRead() override;
++    void OnCanWrite() override;
++    void OnResetStreamReceived(webtransport::StreamErrorCode error) override;
++    void OnStopSendingReceived(webtransport::StreamErrorCode error) override;
++    void OnWriteSideInDataRecvdState() override {}
++
++  private:
++    std::shared_ptr<WebTransportStreamBridge> bridge_;
++  };
++
++  std::unique_ptr<LocalVisitor> makeLocalVisitor() {
++    return std::make_unique<LocalVisitor>(shared_from_this());
++  }
++  std::unique_ptr<PeerVisitor> makePeerVisitor() {
++    return std::make_unique<PeerVisitor>(shared_from_this());
++  }
++
++  // Must be called once after the visitors are installed on both streams. The
++  // WebTransportStreamAdapter of QUICHE does not replay OnCanRead for data that arrived before
++  // SetVisitor(), so any bytes already buffered on either stream would otherwise be stranded. This
++  // pumps both directions once to drain that pre-buffered data; subsequent data is driven by
++  // OnCanRead.
++  void start();
++
++private:
++  // Transfer data from src stream to dst stream. Returns false if write was blocked.
++  bool transferData(webtransport::Stream* src, webtransport::Stream* dst);
++
++  // Raw pointers into the QUIC streams' WebTransport adapters. Each is nulled by the corresponding
++  // visitor's destructor when that stream goes away, so callbacks must null-check before use.
++  std::function<bool()> active_;
++  quic::QuicSpdySession* local_session_;
++  quic::QuicSpdySession* peer_session_;
++  webtransport::Stream* local_;
++  webtransport::Stream* peer_;
++  bool local_fin_forwarded_{false};
++  bool peer_fin_forwarded_{false};
++  bool local_read_blocked_{false};
++  bool peer_read_blocked_{false};
++};
++using WebTransportStreamBridgeSharedPtr = std::shared_ptr<WebTransportStreamBridge>;
++
++/**
++ * Shared state object stored in FilterState to pass WebTransportHttp3 session pointers
++ * between upstream and downstream codecs.
++ */
++class WebTransportSessionBridge;
++class WebTransportSessionState {
++public:
++  Http::WebTransportSession* downstream_transport{nullptr};
++  Http::WebTransportSession* upstream_transport{nullptr};
++  WebTransportSessionBridge* downstream_bridge{nullptr};
++  WebTransportSessionBridge* upstream_bridge{nullptr};
++  std::shared_ptr<bool> downstream_allowed;
++  std::shared_ptr<bool> upstream_allowed;
++  bool active() const;
++
++  // Sets (or, with nullptr, clears) the WebTransport session pointer for each side. A side is
++  // cleared by the WebTransportSessionBridge installed on that session when it (and thus the
++  // session) is destroyed, so the surviving side never bridges to a freed session.
++  //
++  // The session is stored as the webtransport::Session interface rather than the concrete
++  // quic::WebTransportHttp3: every forwarding call the bridge makes (accept/open streams, send
++  // datagrams) is part of that interface, and decoupling from the concrete type both keeps the
++  // dependency minimal and lets the forwarding logic be unit-tested with a mock session.
++  // installBridge() obtains these pointers from
++  // Http::WebTransportSession::rawWebTransportSession().
++  void setUpstreamSession(webtransport::Session* session) { upstream_ = session; }
++  void setDownstreamSession(webtransport::Session* session) { downstream_ = session; }
++  webtransport::Session* upstreamSession() const { return upstream_; }
++  webtransport::Session* downstreamSession() const { return downstream_; }
++
++  // Whether each side's WebTransport session is still alive (its pointer not yet cleared on
++  // teardown). Checked before forwarding so neither side bridges to a dangling session pointer.
++  bool upstreamAlive() const { return upstream_ != nullptr; }
++  bool downstreamAlive() const { return downstream_ != nullptr; }
++
++private:
++  webtransport::Session* upstream_{nullptr};
++  webtransport::Session* downstream_{nullptr};
++};
++using WebTransportSessionStateSharedPtr = std::shared_ptr<WebTransportSessionState>;
++
++/**
++ * Session-level bridge between a downstream and upstream WebTransport session.
++ * Implements webtransport::SessionVisitor to receive incoming streams and datagrams
++ * on one side and forward them to the other.
++ */
++class WebTransportSessionBridge : public webtransport::SessionVisitor,
++                                  protected Logger::Loggable<Logger::Id::quic_stream> {
++public:
++  /**
++   * @param local_session the session this visitor is installed on.
++   * @param peer_session the session on the other side of the proxy.
++   */
++  WebTransportSessionBridge(WebTransportSessionStateSharedPtr session_state, bool is_downstream);
++  // This visitor is owned by its WebTransportHttp3 session (via SetVisitor), so it is destroyed
++  // when that session is torn down. Clear this side's session pointer in the shared state so the
++  // peer's bridge (still alive on the other session) stops forwarding to the now-freed session.
++  ~WebTransportSessionBridge() override;
++
++  // webtransport::SessionVisitor
++  void OnSessionReady() override;
++  void OnSessionClosed(webtransport::SessionErrorCode error_code,
++                       const std::string& error_message) override;
++  void OnIncomingBidirectionalStreamAvailable() override;
++  void OnIncomingUnidirectionalStreamAvailable() override;
++  void OnDatagramReceived(absl::string_view datagram) override;
++  void OnCanCreateNewOutgoingBidirectionalStream() override;
++  void OnCanCreateNewOutgoingUnidirectionalStream() override;
++
++  /**
++   * Creates the shared WebTransportSessionState and installs a WebTransportSessionBridge on each
++   * session, co-owning that state. Takes the Http::WebTransportSession interface (implemented by
++   * the QUIC streams) rather than the concrete quic::WebTransportHttp3 so this can be unit-tested
++   * with a mock: setWebTransportVisitor() wraps the concrete SetVisitor(), and
++   * rawWebTransportSession() supplies the webtransport::Session interface stored in the state for
++   * forwarding. A no-op if either session has no underlying WebTransport session. The state is an
++   * internal detail shared between the two bridges, so it is created here rather than by the
++   * caller.
++   */
++  static void installBridge(Http::WebTransportSession& downstream_session,
++                            Http::WebTransportSession& upstream_session);
++
++  webtransport::Session* localSession() const {
++    return is_downstream_ ? session_state_->downstreamSession() : session_state_->upstreamSession();
++  }
++  webtransport::Session* peerSession() const {
++    return is_downstream_ ? session_state_->upstreamSession() : session_state_->downstreamSession();
++  }
++
++private:
++  void bridgeIncomingStream(webtransport::Stream* local_stream, webtransport::Stream* peer_stream);
++
++  // Clears this bridge's own side of the shared state, so the peer bridge stops forwarding to this
++  // session. Called both when the session closes (OnSessionClosed) and when it is destroyed (the
++  // destructor), since the former can fire while the session object is still alive.
++  void clearLocalSession() {
++    if (is_downstream_) {
++      session_state_->setDownstreamSession(nullptr);
++      session_state_->downstream_transport = nullptr;
++      session_state_->downstream_bridge = nullptr;
++    } else {
++      session_state_->setUpstreamSession(nullptr);
++      session_state_->upstream_transport = nullptr;
++      session_state_->upstream_bridge = nullptr;
++    }
++  }
++
++  WebTransportSessionStateSharedPtr session_state_;
++  const bool is_downstream_{};
++  bool closed_{false};
++};
++
++} // namespace Quic
++} // namespace Envoy
+--- a/source/common/router/upstream_codec_filter.h
++++ b/source/common/router/upstream_codec_filter.h
+@@ -78,6 +78,12 @@
+     const Http::ConnectionPool::Instance::StreamOptions& upstreamStreamOptions() const override {
+       return filter_.callbacks_->upstreamCallbacks()->upstreamStreamOptions();
+     }
++    // Reaches the downstream stream's WebTransport session (via the upstream filter callbacks,
++    // which delegate to the router's downstream StreamDecoderFilterCallbacks) so the upstream codec
++    // can bridge it to the upstream session.
++    OptRef<Http::WebTransportSession> downstreamWebTransportSession() override {
++      return filter_.callbacks_->upstreamCallbacks()->downstreamWebTransportSession();
++    }
+ 
+   private:
+     void maybeEndDecode(bool end_stream);
+--- a/source/common/router/upstream_request.cc
++++ b/source/common/router/upstream_request.cc
+@@ -355,6 +355,10 @@
+ 
+ const Route& UpstreamRequest::route() const { return *parent_.callbacks()->route(); }
+ 
++OptRef<Http::WebTransportSession> UpstreamRequest::downstreamWebTransportSession() {
++  return parent_.callbacks()->webTransportSession();
++}
++
+ OptRef<const Network::Connection> UpstreamRequest::connection() const {
+   return parent_.callbacks()->connection();
+ }
+@@ -811,6 +815,11 @@
+   return upstream_request_.parent_.callbacks()->tracingConfig();
+ }
+ 
++OptRef<Http::WebTransportSession>
++UpstreamRequestFilterManagerCallbacks::downstreamWebTransportSession() {
++  return upstream_request_.parent_.callbacks()->webTransportSession();
++}
++
+ Tracing::Span& UpstreamRequestFilterManagerCallbacks::activeSpan() {
+   return upstream_request_.parent_.callbacks()->activeSpan();
+ }
+--- a/source/common/router/upstream_request.h
++++ b/source/common/router/upstream_request.h
+@@ -97,6 +97,11 @@
+   void decodeHeaders(Http::ResponseHeaderMapPtr&& headers, bool end_stream) override;
+   void decodeTrailers(Http::ResponseTrailerMapPtr&& trailers) override;
+   void dumpState(std::ostream& os, int indent_level) const override;
++  // Reaches the downstream stream's WebTransport session via the router's downstream
++  // StreamDecoderFilterCallbacks. Note: in the usual filter-chain path the codec sees
++  // UpstreamCodecFilter::CodecBridge rather than this decoder; this override covers direct uses of
++  // UpstreamRequest as the decoder.
++  OptRef<Http::WebTransportSession> downstreamWebTransportSession() override;
+ 
+   // UpstreamToDownstream (Http::StreamCallbacks)
+   void onResetStream(Http::StreamResetReason reason,
+@@ -358,6 +363,7 @@
+ 
+   // Http::UpstreamStreamFilterCallbacks
+   StreamInfo::StreamInfo& upstreamStreamInfo() override { return upstream_request_.streamInfo(); }
++  OptRef<Http::WebTransportSession> downstreamWebTransportSession() override;
+   OptRef<GenericUpstream> upstream() override {
+     return makeOptRefFromPtr(upstream_request_.upstream_.get());
+   }
+--- a/source/common/runtime/runtime_features.cc
++++ b/source/common/runtime/runtime_features.cc
+@@ -169,6 +169,8 @@
+ FALSE_RUNTIME_GUARD(envoy_reloadable_features_dns_cache_set_ip_version_to_remove);
+ // TODO(fredyw): evaluate and either make this a config knob or remove.
+ FALSE_RUNTIME_GUARD(envoy_reloadable_features_quic_no_tcp_delay);
++// WebTransport is opt-in and requires explicit routes and continuous authorization.
++FALSE_RUNTIME_GUARD(envoy_reloadable_features_quic_support_web_transport);
+ // Adding runtime flag to use balsa_parser for http_inspector.
+ FALSE_RUNTIME_GUARD(envoy_reloadable_features_http_inspector_use_balsa_parser);
+ // TODO(danzh) re-enable it when the issue of preferring TCP over v6 rather than QUIC over v4 is
+--- a/test/common/quic/BUILD
++++ b/test/common/quic/BUILD
+@@ -6,6 +6,7 @@
+     "envoy_package",
+     "envoy_proto_library",
+     "envoy_select_enable_http3",
++    "envoy_select_enable_http_datagrams",
+ )
+ 
+ licenses(["notice"])  # Apache 2
+@@ -143,6 +144,7 @@
+     srcs = envoy_select_enable_http3(["envoy_quic_client_stream_test.cc"]),
+     rbe_pool = "6gig",
+     deps = envoy_select_enable_http3([
++        "//source/common/quic:web_transport_session_bridge_lib",
+         ":test_utils_lib",
+         "//source/common/http:headers_lib",
+         "//source/common/quic:envoy_quic_alarm_factory_lib",
+@@ -151,6 +153,7 @@
+         "//source/common/quic:envoy_quic_connection_helper_lib",
+         "//test/mocks/http:http_mocks",
+         "//test/mocks/http:stream_decoder_mock",
++        "//test/mocks/http:webtransport_mocks",
+         "//test/mocks/network:network_mocks",
+         "//test/test_common:test_runtime_lib",
+         "//test/test_common:utility_lib",
+@@ -164,6 +167,7 @@
+     srcs = envoy_select_enable_http3(["envoy_quic_server_session_test.cc"]),
+     rbe_pool = "6gig",
+     deps = envoy_select_enable_http3([
++        "//test/test_common:test_runtime_lib",
+         ":test_proof_source_lib",
+         ":test_utils_lib",
+         "//envoy/stats:stats_macros",
+@@ -403,6 +407,17 @@
+ )
+ 
+ envoy_cc_test(
++    name = "web_transport_session_bridge_test",
++    srcs = envoy_select_enable_http3(["web_transport_session_bridge_test.cc"]),
++    rbe_pool = "6gig",
++    deps = envoy_select_enable_http3([
++        "//source/common/quic:web_transport_session_bridge_lib",
++        "//test/mocks/http:webtransport_mocks",
++        "@com_github_google_quiche//:quiche_common_capsule_lib",
++    ]),
++)
++
++envoy_cc_test(
+     name = "cert_compression_test",
+     srcs = envoy_select_enable_http3(["cert_compression_test.cc"]),
+     deps = envoy_select_enable_http3([
+--- a/test/common/quic/envoy_quic_client_session_test.cc
++++ b/test/common/quic/envoy_quic_client_session_test.cc
+@@ -252,6 +252,18 @@
+ 
+ TEST_P(EnvoyQuicClientSessionTest, ShutdownNoOp) { http_connection_->shutdownNotice(); }
+ 
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++// WebTransport is opt-in: the client advertises no WebTransport versions (and so will not negotiate
++// WebTransport) unless envoy.reloadable_features.quic_support_web_transport is enabled.
++TEST_P(EnvoyQuicClientSessionTest, WebTransportNegotiationGatedByRuntimeFlag) {
++  EXPECT_FALSE(envoy_quic_session_->WillNegotiateWebTransport());
++
++  TestScopedRuntime scoped_runtime;
++  scoped_runtime.mergeValues({{"envoy.reloadable_features.quic_support_web_transport", "true"}});
++  EXPECT_TRUE(envoy_quic_session_->WillNegotiateWebTransport());
++}
++#endif
++
+ INSTANTIATE_TEST_SUITE_P(EnvoyQuicClientSessionTest, EnvoyQuicClientSessionTest,
+                          testing::Combine(testing::ValuesIn(quic::CurrentSupportedHttp3Versions()),
+                                           testing::Bool()));
+--- a/test/common/quic/envoy_quic_client_stream_test.cc
++++ b/test/common/quic/envoy_quic_client_stream_test.cc
+@@ -7,6 +7,7 @@
+ #include "test/common/quic/test_utils.h"
+ #include "test/mocks/http/mocks.h"
+ #include "test/mocks/http/stream_decoder.h"
++#include "test/mocks/http/webtransport.h"
+ #include "test/mocks/network/mocks.h"
+ #include "test/test_common/test_runtime.h"
+ #include "test/test_common/utility.h"
+@@ -161,6 +162,49 @@
+     quic_stream_->OnStreamFrame(frame);
+     EXPECT_TRUE(quic_stream_->FinishedReadingHeaders());
+   }
++
++  // Peer SETTINGS that advertise HTTP/3 datagrams, extended CONNECT, and a WebTransport version the
++  // client also supports. Delivering these (with
++  // envoy.reloadable_features.quic_support_web_transport enabled) negotiates WebTransport, after
++  // which QUICHE will create a session for a WebTransport CONNECT.
++  static quic::SettingsFrame webTransportSettings() {
++    quic::SettingsFrame settings;
++    settings.values[quic::SETTINGS_H3_DATAGRAM] = 1;
++    settings.values[quic::SETTINGS_ENABLE_CONNECT_PROTOCOL] = 1;
++    settings.values[quic::SETTINGS_WEBTRANS_DRAFT00] = 1;
++    settings.values[quic::SETTINGS_WEBTRANS_MAX_SESSIONS_DRAFT07] = 1;
++    return settings;
++  }
++
++  // Negotiates WebTransport on the session by delivering the peer SETTINGS above. The caller must
++  // have already enabled envoy.reloadable_features.quic_support_web_transport. After this,
++  // SupportsWebTransport() is true so QUICHE will create a session for a WebTransport CONNECT.
++  void negotiateWebTransport() {
++    EXPECT_TRUE(quic_session_.OnSettingsFrame(webTransportSettings()));
++    ASSERT_TRUE(quic_session_.SupportsWebTransport());
++  }
++
++  // Writes a WebTransport request and returns the upstream WebTransport session QUICHE creates for
++  // it. Requires negotiateWebTransport() to have run. In Envoy a WebTransport request is carried in
++  // its HTTP/1 upgrade form (Connection: Upgrade / Upgrade: webtransport); encodeHeaders converts
++  // it to the HTTP/3 extended CONNECT (:method CONNECT, :protocol webtransport) that QUICHE turns
++  // into a WebTransportHttp3 session at write time.
++  quic::WebTransportHttp3* writeWebTransportConnect() {
++    Http::TestRequestHeaderMapImpl wt_headers = {
++        {":authority", host_}, {":method", "GET"},        {":path", "/"},
++        {":scheme", "https"},  {"connection", "Upgrade"}, {"upgrade", "webtransport"}};
++    EXPECT_TRUE(quic_stream_->encodeHeaders(wt_headers, /*end_stream=*/false).ok());
++    return quic_stream_->web_transport();
++  }
++
++  // Delivers a response with the given status to drive OnInitialHeadersComplete (and thus
++  // mayInitializeWebTransportState).
++  void receiveWebTransportResponse(absl::string_view status) {
++    quiche::HttpHeaderBlock response_headers;
++    response_headers[":status"] = std::string(status);
++    std::string payload = spdyHeaderToHttp3StreamPayload(response_headers);
++    quic_stream_->OnStreamFrame(quic::QuicStreamFrame(stream_id_, /*fin=*/false, 0, payload));
++  }
+ #endif
+ 
+ protected:
+@@ -907,6 +951,156 @@
+   EXPECT_TRUE(quic_stream_->rst_sent());
+ }
+ 
++// A WebTransport CONNECT request encoded before the peer's HTTP/3 SETTINGS arrive must be buffered
++// (not written), because QUICHE only creates the upstream WebTransport session at header-write time
++// and only if WebTransport is already negotiated. Once SETTINGS are received, the buffered request
++// is flushed and written.
++TEST_F(EnvoyQuicClientStreamTest, WebTransportConnectDeferredUntilSettings) {
++  TestScopedRuntime scoped_runtime;
++  scoped_runtime.mergeValues({{"envoy.reloadable_features.quic_support_web_transport", "true"}});
++
++  // SETTINGS have not been received yet in SetUp().
++  EXPECT_FALSE(quic_session_.settings_received());
++
++  Http::TestRequestHeaderMapImpl wt_headers = {
++      {":authority", host_}, {":method", "GET"},        {":path", "/"},
++      {":scheme", "https"},  {"connection", "Upgrade"}, {"upgrade", "webtransport"}};
++  const auto result = quic_stream_->encodeHeaders(wt_headers, /*end_stream=*/false);
++  EXPECT_TRUE(result.ok());
++  // The request is buffered, not written: no header bytes have been encoded onto the stream, and
++  // QUICHE has not created the upstream WebTransport session yet.
++  EXPECT_EQ(0, quic_stream_->bytesMeter()->decompressedHeaderBytesSent());
++  EXPECT_EQ(nullptr, quic_stream_->web_transport());
++
++  // Receiving the peer SETTINGS negotiates WebTransport and flushes the buffered request, which is
++  // now written; QUICHE creates the upstream WebTransport session as part of writing it.
++  EXPECT_TRUE(quic_session_.OnSettingsFrame(webTransportSettings()));
++  EXPECT_GT(quic_stream_->bytesMeter()->decompressedHeaderBytesSent(), 0);
++  EXPECT_NE(nullptr, quic_stream_->web_transport());
++
++  // The connection is closed in TearDown() before any response is received, which resets the
++  // stream.
++  EXPECT_CALL(stream_callbacks_, onResetStream(_, _));
++}
++
++// A non-WebTransport request is never deferred: it is written immediately even before SETTINGS.
++TEST_F(EnvoyQuicClientStreamTest, NonWebTransportRequestNotDeferred) {
++  EXPECT_FALSE(quic_session_.settings_received());
++  const auto result = quic_stream_->encodeHeaders(request_headers_, /*end_stream=*/true);
++  EXPECT_TRUE(result.ok());
++  EXPECT_GT(quic_stream_->bytesMeter()->decompressedHeaderBytesSent(), 0);
++  // A non-WebTransport request never creates a WebTransport session.
++  EXPECT_EQ(nullptr, quic_stream_->web_transport());
++
++  // The connection is closed in TearDown() before any response is received, which resets the
++  // stream.
++  EXPECT_CALL(stream_callbacks_, onResetStream(_, _));
++}
++
++// Once SETTINGS have been received, a WebTransport CONNECT is written immediately rather than
++// buffered.
++TEST_F(EnvoyQuicClientStreamTest, WebTransportConnectNotDeferredAfterSettings) {
++  TestScopedRuntime scoped_runtime;
++  scoped_runtime.mergeValues({{"envoy.reloadable_features.quic_support_web_transport", "true"}});
++
++  // Negotiate WebTransport up front so SETTINGS are already received when the CONNECT is encoded.
++  EXPECT_TRUE(quic_session_.OnSettingsFrame(webTransportSettings()));
++  ASSERT_TRUE(quic_session_.settings_received());
++
++  Http::TestRequestHeaderMapImpl wt_headers = {
++      {":authority", host_}, {":method", "GET"},        {":path", "/"},
++      {":scheme", "https"},  {"connection", "Upgrade"}, {"upgrade", "webtransport"}};
++  const auto result = quic_stream_->encodeHeaders(wt_headers, /*end_stream=*/false);
++  EXPECT_TRUE(result.ok());
++  // Written immediately (not buffered), and the upstream WebTransport session is created now.
++  EXPECT_GT(quic_stream_->bytesMeter()->decompressedHeaderBytesSent(), 0);
++  EXPECT_NE(nullptr, quic_stream_->web_transport());
++
++  // The connection is closed in TearDown() before any response is received, which resets the
++  // stream.
++  EXPECT_CALL(stream_callbacks_, onResetStream(_, _));
++}
++
++// If the stream is reset while a WebTransport CONNECT is still buffered awaiting SETTINGS, the
++// pending request is dropped and the stream unregisters from the session, so a later SETTINGS frame
++// does not flush a dead stream (no crash, nothing written).
++TEST_F(EnvoyQuicClientStreamTest, WebTransportConnectResetWhilePending) {
++  TestScopedRuntime scoped_runtime;
++  scoped_runtime.mergeValues({{"envoy.reloadable_features.quic_support_web_transport", "true"}});
++
++  EXPECT_FALSE(quic_session_.settings_received());
++  Http::TestRequestHeaderMapImpl wt_headers = {
++      {":authority", host_}, {":method", "GET"},        {":path", "/"},
++      {":scheme", "https"},  {"connection", "Upgrade"}, {"upgrade", "webtransport"}};
++  EXPECT_TRUE(quic_stream_->encodeHeaders(wt_headers, /*end_stream=*/false).ok());
++  // Buffered, not written, and no WebTransport session created yet.
++  EXPECT_EQ(0, quic_stream_->bytesMeter()->decompressedHeaderBytesSent());
++  EXPECT_EQ(nullptr, quic_stream_->web_transport());
++
++  // Reset the stream while pending; this runs OnClose, which unregisters the pending request.
++  EXPECT_CALL(stream_callbacks_, onResetStream(_, _));
++  quic_stream_->resetStream(Http::StreamResetReason::LocalReset);
++
++  // A subsequent SETTINGS frame (even one negotiating WebTransport) must not flush the now-reset
++  // request: nothing is written and no WebTransport session is created.
++  EXPECT_TRUE(quic_session_.OnSettingsFrame(webTransportSettings()));
++  EXPECT_EQ(0, quic_stream_->bytesMeter()->decompressedHeaderBytesSent());
++  EXPECT_EQ(nullptr, quic_stream_->web_transport());
++}
++
++// Once WebTransport is negotiated, QUICHE creates the upstream session when the WebTransport
++// CONNECT is written. On a 2xx response, mayInitializeWebTransportState() consults the response
++// decoder for the paired downstream session; with none available it must NOT install a bridge.
++TEST_F(EnvoyQuicClientStreamTest, WebTransportConnectResponseWithoutDownstreamDoesNotBridge) {
++  TestScopedRuntime scoped_runtime;
++  scoped_runtime.mergeValues({{"envoy.reloadable_features.quic_support_web_transport", "true"}});
++
++  negotiateWebTransport();
++  // Writing the CONNECT creates the upstream WebTransport session synchronously (settings received,
++  // so it is not deferred).
++  EXPECT_NE(writeWebTransportConnect(), nullptr);
++
++  // The 2xx response reaches mayInitializeWebTransportState, which queries the decoder for the
++  // downstream session. The decoder reports none, so no bridge is installed.
++  EXPECT_CALL(stream_decoder_, downstreamWebTransportSession())
++      .WillOnce(testing::Return(OptRef<Http::WebTransportSession>{}));
++  EXPECT_CALL(stream_decoder_, decodeHeaders_(_, /*end_stream=*/false));
++  receiveWebTransportResponse("200");
++
++  // The connection is closed in TearDown() while the stream is still open, which resets it.
++  EXPECT_CALL(stream_callbacks_, onResetStream(_, _));
++}
++
++// The bridging counterpart of the test above: when the decoder reports a downstream WebTransport
++// session whose underlying QUICHE session is live, a 2xx response makes
++// mayInitializeWebTransportState call installBridge(downstream, *this). installBridge then wires
++// both sides, which is observable as a session visitor being installed on the (mock) downstream
++// session.
++TEST_F(EnvoyQuicClientStreamTest, WebTransportConnectResponseBridgesDownstream) {
++  TestScopedRuntime scoped_runtime;
++  scoped_runtime.mergeValues({{"envoy.reloadable_features.quic_support_web_transport", "true"}});
++
++  negotiateWebTransport();
++  // Writing the CONNECT creates the upstream WebTransport session synchronously.
++  EXPECT_NE(writeWebTransportConnect(), nullptr);
++
++  // The decoder supplies a downstream WebTransport session whose raw QUICHE session is non-null, so
++  // installBridge proceeds past its null-guard and installs the bridge visitor on it.
++  NiceMock<Http::MockWebTransportSession> downstream_session;
++  NiceMock<Http::MockRawWebTransportSession> downstream_raw;
++  ON_CALL(downstream_session, rawWebTransportSession())
++      .WillByDefault(testing::Return(&downstream_raw));
++  EXPECT_CALL(downstream_session, setWebTransportVisitor(_));
++
++  EXPECT_CALL(stream_decoder_, downstreamWebTransportSession())
++      .WillOnce(testing::Return(OptRef<Http::WebTransportSession>(downstream_session)));
++  EXPECT_CALL(stream_decoder_, decodeHeaders_(_, /*end_stream=*/false));
++  receiveWebTransportResponse("200");
++
++  // The connection is closed in TearDown() while the stream is still open, which resets it.
++  EXPECT_CALL(stream_callbacks_, onResetStream(_, _));
++}
++
+ #endif
+ 
+ TEST_F(EnvoyQuicClientStreamTest, InconsistentContentLengthHeadersOnly) {
+--- a/test/common/quic/envoy_quic_server_session_test.cc
++++ b/test/common/quic/envoy_quic_server_session_test.cc
+@@ -24,6 +24,7 @@
+ #include "test/test_common/global.h"
+ #include "test/test_common/logging.h"
+ #include "test/test_common/simulated_time_system.h"
++#include "test/test_common/test_runtime.h"
+ 
+ #include "gmock/gmock.h"
+ #include "gtest/gtest.h"
+@@ -1238,6 +1239,32 @@
+   installReadFilter();
+ }
+ 
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++// WebTransport is opt-in: even with extended CONNECT enabled, the server advertises no WebTransport
++// versions (and so will not negotiate WebTransport) unless
++// envoy.reloadable_features.quic_support_web_transport is enabled.
++TEST_F(EnvoyQuicServerSessionTest, WebTransportNegotiationGatedByRuntimeFlag) {
++  envoy::config::core::v3::Http3ProtocolOptions http3_options;
++  http3_options.set_allow_extended_connect(true);
++  envoy_quic_session_.setHttp3Options(http3_options);
++
++  // Disabled by default, even though extended CONNECT is enabled.
++  EXPECT_FALSE(envoy_quic_session_.WillNegotiateWebTransport());
++
++  TestScopedRuntime scoped_runtime;
++  scoped_runtime.mergeValues({{"envoy.reloadable_features.quic_support_web_transport", "true"}});
++  EXPECT_TRUE(envoy_quic_session_.WillNegotiateWebTransport());
++
++  // WebTransport still requires extended CONNECT, even with the runtime flag enabled.
++  envoy::config::core::v3::Http3ProtocolOptions no_extended_connect;
++  no_extended_connect.set_allow_extended_connect(false);
++  envoy_quic_session_.setHttp3Options(no_extended_connect);
++  EXPECT_FALSE(envoy_quic_session_.WillNegotiateWebTransport());
++
++  installReadFilter();
++}
++#endif
++
+ TEST_F(EnvoyQuicServerSessionTest, SetSocketOption) {
+   installReadFilter();
+ 
+--- a/test/common/quic/envoy_quic_server_stream_test.cc
++++ b/test/common/quic/envoy_quic_server_stream_test.cc
+@@ -104,8 +104,22 @@
+     // buffers data until the SETTINGS frame is received.
+     quic::SettingsFrame settings;
+     settings.values[quic::SETTINGS_H3_DATAGRAM] = 1;
++#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
++    if (enableWebTransport()) {
++      // Advertise WebTransport locally and in the peer's SETTINGS so QUICHE negotiates WebTransport
++      // and creates a WebTransportHttp3 session for an extended-CONNECT ":protocol: webtransport"
++      // request (which makes EnvoyQuicServerStream::web_transport() non-null).
++      quic_session_.setLocallySupportedWebTransportVersions(
++          quic::kDefaultSupportedWebTransportVersions);
++      settings.values[quic::SETTINGS_WEBTRANS_DRAFT00] = 1;
++      settings.values[quic::SETTINGS_WEBTRANS_MAX_SESSIONS_DRAFT07] = 1;
++    }
++#endif
+     EXPECT_TRUE(quic_session_.OnSettingsFrame(settings));
+   }
++
++  // Overridden by the WebTransport fixture to negotiate WebTransport during SetUp().
++  virtual bool enableWebTransport() const { return false; }
+ 
+   void TearDown() override {
+     if (quic_connection_.connected()) {
+@@ -156,6 +170,27 @@
+     Http::TestResponseHeaderMapImpl response_headers = {{":status", "200"},
+                                                         {"capsule-protocol", "?1"}};
+     quic_stream_->encodeHeaders(response_headers, close_send_stream);
++  }
++
++  // Sends a WebTransport extended-CONNECT request, leaving the stream open. After this QUICHE has
++  // created the stream's WebTransportHttp3 session (web_transport() is non-null). Returns the byte
++  // length consumed so callers can frame subsequent data at the right offset. Requires
++  // enableWebTransport() to be true.
++  size_t setUpWebTransportConnect() {
++    EXPECT_CALL(stream_decoder_, decodeHeaders_(_, /*end_stream=*/false));
++    quiche::HttpHeaderBlock request_headers;
++    request_headers[":authority"] = host_;
++    request_headers[":method"] = "CONNECT";
++    request_headers[":protocol"] = "webtransport";
++    request_headers[":path"] = "/";
++    request_headers[":scheme"] = "https";
++    std::string payload = spdyHeaderToHttp3StreamPayload(request_headers);
++    quic::QuicStreamFrame frame(stream_id_, /*fin=*/false, 0, payload);
++    quic_stream_->OnStreamFrame(frame);
++    EXPECT_TRUE(quic_stream_->FinishedReadingHeaders());
++    // QUICHE created the WebTransport session for the negotiated extended CONNECT.
++    EXPECT_TRUE(quic_stream_->webTransportSession().has_value());
++    return payload.length();
+   }
+ #endif
+ 
+@@ -934,6 +969,75 @@
+   EXPECT_CALL(stream_decoder_, decodeData(_, _)).Times(0);
+   quic_session_.OnDatagramReceived(datagram_fragment_);
+ }
++
++// A WebTransport CONNECT stream is header-only at the HTTP layer; trailers/METADATA/body are not
++// part of WebTransport. EnvoyQuicServerStream::resetIfWebTransport() resets such a stream so the
++// offending frame is never proxied upstream. (Body never reaches OnBodyAvailable because QUICHE
++// routes a WebTransport stream's DATA through its capsule parser, so the reachable receive-path
++// violations tested here are trailers and METADATA, which share the same resetIfWebTransport().)
++class EnvoyQuicServerStreamWebTransportTest : public EnvoyQuicServerStreamTest {
++protected:
++  bool enableWebTransport() const override { return true; }
++};
++
++TEST_F(EnvoyQuicServerStreamWebTransportTest, TrailersResetWebTransportStream) {
++  size_t offset = setUpWebTransportConnect();
++  // The trailers must be rejected (stream reset), not decoded and proxied.
++  EXPECT_CALL(stream_decoder_, decodeTrailers_(_)).Times(0);
++  EXPECT_CALL(quic_session_, MaybeSendRstStreamFrame(_, _, _));
++  EXPECT_CALL(quic_session_, MaybeSendStopSendingFrame(_, _)).Times(testing::AtMost(1));
++  EXPECT_CALL(stream_callbacks_, onResetStream(_, _));
++  receiveTrailers(offset);
++}
++
++TEST_F(EnvoyQuicServerStreamWebTransportTest, MetadataResetsWebTransportStream) {
++  setUpWebTransportConnect();
++  // METADATA on a WebTransport CONNECT stream is a protocol violation: it must reset the stream
++  // rather than be decoded. Drive OnMetadataComplete directly with an empty (sub-limit) header
++  // list so the only relevant branch exercised is resetIfWebTransport("metadata").
++  EXPECT_CALL(quic_session_, MaybeSendRstStreamFrame(_, _, _));
++  EXPECT_CALL(quic_session_, MaybeSendStopSendingFrame(_, _)).Times(testing::AtMost(1));
++  EXPECT_CALL(stream_callbacks_, onResetStream(_, _));
++  quic::QuicHeaderList header_list;
++  quic_stream_->OnMetadataComplete(/*frame_len=*/0, header_list);
++}
++
++// A valid WebTransport extended-CONNECT exposes the stream's WebTransport session through
++// webTransportSession(): it returns a value, that value is the stream itself (which implements the
++// Http::WebTransportSession interface), and its rawWebTransportSession() is the QUICHE session
++// QUICHE created for the CONNECT. This is the handle the upstream codec bridges to.
++TEST_F(EnvoyQuicServerStreamWebTransportTest, WebTransportSessionAvailableForWebTransportConnect) {
++  setUpWebTransportConnect();
++
++  OptRef<Http::WebTransportSession> session = quic_stream_->webTransportSession();
++  ASSERT_TRUE(session.has_value());
++  EXPECT_EQ(session.ptr(), static_cast<Http::WebTransportSession*>(quic_stream_));
++  ASSERT_NE(quic_stream_->web_transport(), nullptr);
++  EXPECT_EQ(session->rawWebTransportSession(), quic_stream_->web_transport());
++
++  // The stream is left open; TearDown closes the connection, which resets it.
++  EXPECT_CALL(stream_callbacks_, onResetStream(_, _));
++}
++
++// A regular request (not an extended CONNECT) on a WebTransport-capable session is not a
++// WebTransport stream: QUICHE creates no WebTransport session, so webTransportSession() is empty.
++TEST_F(EnvoyQuicServerStreamWebTransportTest, NoWebTransportSessionForRegularRequest) {
++  EXPECT_CALL(stream_decoder_, decodeHeaders_(_, /*end_stream=*/false));
++  quiche::HttpHeaderBlock request_headers;
++  request_headers[":authority"] = host_;
++  request_headers[":method"] = "GET";
++  request_headers[":path"] = "/";
++  request_headers[":scheme"] = "https";
++  std::string payload = spdyHeaderToHttp3StreamPayload(request_headers);
++  quic_stream_->OnStreamFrame(quic::QuicStreamFrame(stream_id_, /*fin=*/false, 0, payload));
++  EXPECT_TRUE(quic_stream_->FinishedReadingHeaders());
++
++  EXPECT_EQ(quic_stream_->web_transport(), nullptr);
++  EXPECT_FALSE(quic_stream_->webTransportSession().has_value());
++
++  // The stream is left open; TearDown closes the connection, which resets it.
++  EXPECT_CALL(stream_callbacks_, onResetStream(_, _));
++}
+ #endif
+ 
+ TEST_F(EnvoyQuicServerStreamTest, RegularHeaderBeforePseudoHeader) {
+--- a/test/common/quic/test_utils.h
++++ b/test/common/quic/test_utils.h
+@@ -148,10 +148,19 @@
+ 
+   using quic::QuicSpdySession::ActivateStream;
+ 
++  // Lets tests enable WebTransport negotiation. Empty by default so existing tests are unaffected:
++  // WebTransport is not negotiated and a stream's web_transport() stays null.
++  void setLocallySupportedWebTransportVersions(quic::WebTransportHttp3VersionSet versions) {
++    locally_supported_web_transport_versions_ = versions;
++  }
++
+ protected:
+   quic::HttpDatagramSupport LocalHttpDatagramSupport() override {
+     return quic::HttpDatagramSupport::kRfc;
+   }
++  quic::WebTransportHttp3VersionSet LocallySupportedWebTransportVersions() const override {
++    return locally_supported_web_transport_versions_;
++  }
+   bool hasDataToWrite() override { return HasDataToWrite(); }
+   const quic::QuicConnection* quicConnection() const override {
+     return initialized_ ? connection() : nullptr;
+@@ -160,6 +169,7 @@
+ 
+ private:
+   std::unique_ptr<quic::QuicCryptoStream> crypto_stream_;
++  quic::WebTransportHttp3VersionSet locally_supported_web_transport_versions_;
+ };
+ 
+ class TestQuicCryptoClientStream : public quic::QuicCryptoClientStream {
+@@ -173,6 +183,8 @@
+ 
+   bool encryption_established() const override { return true; }
+   quic::HandshakeState GetHandshakeState() const override { return quic::HANDSHAKE_CONFIRMED; }
++  void SetServerApplicationStateForResumption(
++      std::unique_ptr<quic::ApplicationState> /*application_state*/) override {}
+ };
+ 
+ class TestQuicCryptoClientStreamFactory : public EnvoyQuicCryptoClientStreamFactoryInterface {
+--- /dev/null
++++ b/test/common/quic/web_transport_session_bridge_test.cc
+@@ -0,0 +1,657 @@
++#include <string>
++
++#include "source/common/quic/web_transport_session_bridge.h"
++
++#include "test/mocks/http/webtransport.h"
++
++#include "gmock/gmock.h"
++#include "gtest/gtest.h"
++
++namespace Envoy {
++namespace Quic {
++namespace {
++
++using ::testing::_;
++using ::testing::A;
++using ::testing::NiceMock;
++using ::testing::Return;
++
++// The WebTransport mocks are shared via test/mocks/http so other tests can reuse them.
++using Http::MockRawWebTransportSession;
++using Http::MockWebTransportSession;
++using Http::MockWebTransportStream;
++
++// Bundles the two mock streams and the bridge under test. A plain struct (not a gtest fixture) so
++// the tests stay simple TEST() cases. `local`/`peer` mirror the bridge's own naming: the
++// LocalVisitor forwards local->peer and the PeerVisitor forwards peer->local.
++struct StreamBridgeHarness {
++  StreamBridgeHarness()
++      : bridge(std::make_shared<WebTransportStreamBridge>(&local_stream, &peer_stream)) {
++    // By default both write sides can accept data; backpressure tests override this.
++    ON_CALL(local_stream, CanWrite()).WillByDefault(Return(true));
++    ON_CALL(peer_stream, CanWrite()).WillByDefault(Return(true));
++    // By default a stream has no more data to read after the test's seeded read.
++    ON_CALL(local_stream, Read(testing::A<absl::Span<char>>()))
++        .WillByDefault(Return(webtransport::Stream::ReadResult{0, false}));
++    ON_CALL(peer_stream, Read(testing::A<absl::Span<char>>()))
++        .WillByDefault(Return(webtransport::Stream::ReadResult{0, false}));
++  }
++  testing::NiceMock<MockWebTransportStream> local_stream;
++  testing::NiceMock<MockWebTransportStream> peer_stream;
++  WebTransportStreamBridgeSharedPtr bridge;
++};
++
++// Returns a lambda usable as a Read() action that copies `data` into the caller's buffer and
++// reports the given fin bit.
++auto readReturning(std::string data, bool fin) {
++  return
++      [data = std::move(data), fin](absl::Span<char> buffer) -> webtransport::Stream::ReadResult {
++        std::copy(data.begin(), data.end(), buffer.data());
++        return {data.size(), fin};
++      };
++}
++
++TEST(WebTransportStreamBridgeTest, LocalVisitorForwardsDataToPeer) {
++  StreamBridgeHarness h;
++  auto visitor = h.bridge->makeLocalVisitor();
++
++  // Local returns some data on the first read, then nothing (drains the loop).
++  EXPECT_CALL(h.local_stream, Read(testing::A<absl::Span<char>>()))
++      .WillOnce(readReturning("hello", false))
++      .WillRepeatedly(Return(webtransport::Stream::ReadResult{0, false}));
++  EXPECT_CALL(h.peer_stream, Writev(_, _)).WillOnce(Return(absl::OkStatus()));
++
++  visitor->OnCanRead();
++}
++
++TEST(WebTransportStreamBridgeTest, PeerVisitorForwardsDataToLocal) {
++  StreamBridgeHarness h;
++  auto visitor = h.bridge->makePeerVisitor();
++
++  EXPECT_CALL(h.peer_stream, Read(testing::A<absl::Span<char>>()))
++      .WillOnce(readReturning("world", false))
++      .WillRepeatedly(Return(webtransport::Stream::ReadResult{0, false}));
++  EXPECT_CALL(h.local_stream, Writev(_, _)).WillOnce(Return(absl::OkStatus()));
++
++  visitor->OnCanRead();
++}
++
++// Multiple readable chunks in one OnCanRead are each forwarded until the source drains.
++TEST(WebTransportStreamBridgeTest, ForwardsMultipleChunksUntilDrained) {
++  StreamBridgeHarness h;
++  auto visitor = h.bridge->makeLocalVisitor();
++
++  EXPECT_CALL(h.local_stream, Read(testing::A<absl::Span<char>>()))
++      .WillOnce(readReturning("chunk1", false))
++      .WillOnce(readReturning("chunk2", false))
++      .WillRepeatedly(Return(webtransport::Stream::ReadResult{0, false}));
++  EXPECT_CALL(h.peer_stream, Writev(_, _)).Times(2).WillRepeatedly(Return(absl::OkStatus()));
++
++  visitor->OnCanRead();
++}
++
++TEST(WebTransportStreamBridgeTest, LocalResetForwardedToPeer) {
++  StreamBridgeHarness h;
++  auto visitor = h.bridge->makeLocalVisitor();
++
++  EXPECT_CALL(h.peer_stream, ResetWithUserCode(42));
++  visitor->OnResetStreamReceived(42);
++}
++
++TEST(WebTransportStreamBridgeTest, PeerResetForwardedToLocal) {
++  StreamBridgeHarness h;
++  auto visitor = h.bridge->makePeerVisitor();
++
++  EXPECT_CALL(h.local_stream, ResetWithUserCode(99));
++  visitor->OnResetStreamReceived(99);
++}
++
++TEST(WebTransportStreamBridgeTest, LocalStopSendingForwardedToPeer) {
++  StreamBridgeHarness h;
++  auto visitor = h.bridge->makeLocalVisitor();
++
++  EXPECT_CALL(h.peer_stream, SendStopSending(7));
++  visitor->OnStopSendingReceived(7);
++}
++
++TEST(WebTransportStreamBridgeTest, PeerStopSendingForwardedToLocal) {
++  StreamBridgeHarness h;
++  auto visitor = h.bridge->makePeerVisitor();
++
++  EXPECT_CALL(h.local_stream, SendStopSending(8));
++  visitor->OnStopSendingReceived(8);
++}
++
++TEST(WebTransportStreamBridgeTest, FinWithDataForwardedOnRead) {
++  StreamBridgeHarness h;
++  auto visitor = h.bridge->makeLocalVisitor();
++
++  // Local returns FIN together with data; a single write carries both.
++  EXPECT_CALL(h.local_stream, Read(testing::A<absl::Span<char>>()))
++      .WillOnce(readReturning("bye", true));
++  EXPECT_CALL(h.peer_stream, Writev(_, _))
++      .WillOnce(
++          [](absl::Span<quiche::QuicheMemSlice>, const quiche::StreamWriteOptions& options) {
++            EXPECT_TRUE(options.send_fin());
++            return absl::OkStatus();
++          });
++
++  visitor->OnCanRead();
++}
++
++// A FIN with no data still propagates as an empty, fin-bearing write so the destination half-close
++// is forwarded.
++TEST(WebTransportStreamBridgeTest, EmptyFinForwardedOnRead) {
++  StreamBridgeHarness h;
++  auto visitor = h.bridge->makeLocalVisitor();
++
++  EXPECT_CALL(h.local_stream, Read(testing::A<absl::Span<char>>()))
++      .WillOnce(Return(webtransport::Stream::ReadResult{0, true}));
++  EXPECT_CALL(h.peer_stream, Writev(_, _))
++      .WillOnce([](absl::Span<quiche::QuicheMemSlice> data,
++                   const quiche::StreamWriteOptions& options) {
++        EXPECT_TRUE(data.empty());
++        EXPECT_TRUE(options.send_fin());
++        return absl::OkStatus();
++      });
++
++  visitor->OnCanRead();
++}
++
++// A write failure that is not flow-control backpressure (CanWrite() was true) is terminal for the
++// direction: the bridge stops rather than spinning, so the source is read only once.
++TEST(WebTransportStreamBridgeTest, WriteFailureIsTerminalAndDoesNotSpin) {
++  StreamBridgeHarness h;
++  auto visitor = h.bridge->makeLocalVisitor();
++
++  EXPECT_CALL(h.local_stream, Read(testing::A<absl::Span<char>>()))
++      .WillOnce(readReturning("data", false));
++  EXPECT_CALL(h.peer_stream, Writev(_, _)).WillOnce(Return(absl::InternalError("write failed")));
++
++  visitor->OnCanRead();
++}
++
++// OnCanWrite is a no-op when the opposite direction was not paused: nothing is read or written.
++TEST(WebTransportStreamBridgeTest, OnCanWriteIsNoOpWhenNotBlocked) {
++  StreamBridgeHarness h;
++  auto visitor = h.bridge->makeLocalVisitor();
++
++  EXPECT_CALL(h.peer_stream, Read(testing::A<absl::Span<char>>())).Times(0);
++  EXPECT_CALL(h.local_stream, Writev(_, _)).Times(0);
++
++  visitor->OnCanWrite();
++}
++
++// A blocked destination must not consume data from the source (no data loss): the bytes stay in
++// the source stream until the destination can accept a write.
++TEST(WebTransportStreamBridgeTest, BlockedDestinationDoesNotConsumeSource) {
++  StreamBridgeHarness h;
++  auto visitor = h.bridge->makeLocalVisitor();
++
++  // Peer (the destination for local->peer) cannot accept writes.
++  EXPECT_CALL(h.peer_stream, CanWrite()).WillRepeatedly(Return(false));
++  EXPECT_CALL(h.local_stream, Read(testing::A<absl::Span<char>>())).Times(0);
++  EXPECT_CALL(h.peer_stream, Writev(_, _)).Times(0);
++
++  visitor->OnCanRead();
++}
++
++// When the destination unblocks, the paused direction resumes and forwards the pending data.
++TEST(WebTransportStreamBridgeTest, ResumesForwardingWhenDestinationUnblocks) {
++  StreamBridgeHarness h;
++  auto local_visitor = h.bridge->makeLocalVisitor();
++  auto peer_visitor = h.bridge->makePeerVisitor();
++
++  bool peer_writable = false;
++  EXPECT_CALL(h.peer_stream, CanWrite()).WillRepeatedly([&] { return peer_writable; });
++
++  // The data is only read once the write side is available, so seed it up front; it must not be
++  // consumed while the peer is blocked.
++  EXPECT_CALL(h.local_stream, Read(testing::A<absl::Span<char>>()))
++      .WillOnce(readReturning("resumed", false))
++      .WillRepeatedly(Return(webtransport::Stream::ReadResult{0, false}));
++  EXPECT_CALL(h.peer_stream, Writev(_, _)).WillOnce(Return(absl::OkStatus()));
++
++  // Peer blocked: OnCanRead records the block and reads nothing.
++  local_visitor->OnCanRead();
++
++  // Peer becomes writable; its OnCanWrite resumes the local->peer direction.
++  peer_writable = true;
++  peer_visitor->OnCanWrite();
++}
++
++// Symmetric to the above: when the local write side unblocks, LocalVisitor::OnCanWrite resumes the
++// paused peer->local direction.
++TEST(WebTransportStreamBridgeTest, LocalOnCanWriteResumesPeerDirection) {
++  StreamBridgeHarness h;
++  auto local_visitor = h.bridge->makeLocalVisitor();
++  auto peer_visitor = h.bridge->makePeerVisitor();
++
++  bool local_writable = false;
++  EXPECT_CALL(h.local_stream, CanWrite()).WillRepeatedly([&] { return local_writable; });
++
++  EXPECT_CALL(h.peer_stream, Read(A<absl::Span<char>>()))
++      .WillOnce(readReturning("resumed", false))
++      .WillRepeatedly(Return(webtransport::Stream::ReadResult{0, false}));
++  EXPECT_CALL(h.local_stream, Writev(_, _)).WillOnce(Return(absl::OkStatus()));
++
++  // Local blocked: peer's OnCanRead records the block and reads nothing.
++  peer_visitor->OnCanRead();
++
++  // Local becomes writable; its OnCanWrite resumes the peer->local direction.
++  local_writable = true;
++  local_visitor->OnCanWrite();
++}
++
++// start() pumps both directions once so data already buffered before the visitors were installed is
++// not stranded (QUICHE does not replay OnCanRead for it).
++TEST(WebTransportStreamBridgeTest, StartPumpsBothDirections) {
++  StreamBridgeHarness h;
++  // Visitors must exist (they are normally installed before start()), though start() reads the
++  // bridge's own stream pointers directly.
++  auto local_visitor = h.bridge->makeLocalVisitor();
++  auto peer_visitor = h.bridge->makePeerVisitor();
++
++  EXPECT_CALL(h.local_stream, Read(A<absl::Span<char>>()))
++      .WillOnce(readReturning("pre-buffered-local", false))
++      .WillRepeatedly(Return(webtransport::Stream::ReadResult{0, false}));
++  EXPECT_CALL(h.peer_stream, Read(A<absl::Span<char>>()))
++      .WillOnce(readReturning("pre-buffered-peer", false))
++      .WillRepeatedly(Return(webtransport::Stream::ReadResult{0, false}));
++  EXPECT_CALL(h.peer_stream, Writev(_, _)).WillOnce(Return(absl::OkStatus()));
++  EXPECT_CALL(h.local_stream, Writev(_, _)).WillOnce(Return(absl::OkStatus()));
++
++  h.bridge->start();
++}
++
++// start() records a per-direction block when a destination cannot accept the pre-buffered data.
++TEST(WebTransportStreamBridgeTest, StartRecordsBlockWhenDestinationFull) {
++  StreamBridgeHarness h;
++  auto local_visitor = h.bridge->makeLocalVisitor();
++  auto peer_visitor = h.bridge->makePeerVisitor();
++
++  // Neither destination can accept writes, so start() reads nothing and marks both directions
++  // blocked. No Read/Writev happens (a blocked destination must not consume the source).
++  EXPECT_CALL(h.local_stream, CanWrite()).WillRepeatedly(Return(false));
++  EXPECT_CALL(h.peer_stream, CanWrite()).WillRepeatedly(Return(false));
++  EXPECT_CALL(h.local_stream, Read(A<absl::Span<char>>())).Times(0);
++  EXPECT_CALL(h.peer_stream, Read(A<absl::Span<char>>())).Times(0);
++
++  h.bridge->start();
++}
++
++// start() is a no-op once a stream has gone away (its visitor was destroyed, nulling the pointer).
++TEST(WebTransportStreamBridgeTest, StartNoOpWhenStreamMissing) {
++  StreamBridgeHarness h;
++  {
++    // Destroying the local visitor nulls the bridge's local_ pointer.
++    auto local_visitor = h.bridge->makeLocalVisitor();
++  }
++  EXPECT_CALL(h.local_stream, Read(A<absl::Span<char>>())).Times(0);
++  EXPECT_CALL(h.peer_stream, Read(A<absl::Span<char>>())).Times(0);
++
++  h.bridge->start();
++}
++
++// After the peer stream is gone (its visitor destroyed), the surviving local visitor's callbacks
++// must short-circuit instead of dereferencing the freed peer.
++TEST(WebTransportStreamBridgeTest, LocalVisitorShortCircuitsAfterPeerGone) {
++  StreamBridgeHarness h;
++  auto local_visitor = h.bridge->makeLocalVisitor();
++  { auto peer_visitor = h.bridge->makePeerVisitor(); } // Destroyed here; nulls bridge->peer_.
++
++  EXPECT_CALL(h.local_stream, Read(A<absl::Span<char>>())).Times(0);
++  EXPECT_CALL(h.peer_stream, ResetWithUserCode(_)).Times(0);
++  EXPECT_CALL(h.peer_stream, SendStopSending(_)).Times(0);
++
++  local_visitor->OnCanRead();
++  local_visitor->OnCanWrite();
++  // Reset/stop-sending forwarding must not touch the gone peer.
++  local_visitor->OnResetStreamReceived(1);
++  local_visitor->OnStopSendingReceived(1);
++}
++
++// Symmetric: after the local stream is gone, the surviving peer visitor's callbacks short-circuit.
++TEST(WebTransportStreamBridgeTest, PeerVisitorShortCircuitsAfterLocalGone) {
++  StreamBridgeHarness h;
++  auto peer_visitor = h.bridge->makePeerVisitor();
++  { auto local_visitor = h.bridge->makeLocalVisitor(); } // Destroyed here; nulls bridge->local_.
++
++  EXPECT_CALL(h.peer_stream, Read(A<absl::Span<char>>())).Times(0);
++  EXPECT_CALL(h.local_stream, ResetWithUserCode(_)).Times(0);
++  EXPECT_CALL(h.local_stream, SendStopSending(_)).Times(0);
++
++  peer_visitor->OnCanRead();
++  peer_visitor->OnCanWrite();
++  peer_visitor->OnResetStreamReceived(1);
++  peer_visitor->OnStopSendingReceived(1);
++}
++
++// --- WebTransportSessionState ---
++
++TEST(WebTransportSessionStateTest, StoresAndRetrievesSessions) {
++  WebTransportSessionState state;
++
++  EXPECT_EQ(state.upstreamSession(), nullptr);
++  EXPECT_EQ(state.downstreamSession(), nullptr);
++
++  // Use sentinel pointers for testing (never dereferenced).
++  auto* fake_upstream = reinterpret_cast<webtransport::Session*>(0x1234);
++  auto* fake_downstream = reinterpret_cast<webtransport::Session*>(0x5678);
++
++  state.setUpstreamSession(fake_upstream);
++  state.setDownstreamSession(fake_downstream);
++
++  EXPECT_EQ(state.upstreamSession(), fake_upstream);
++  EXPECT_EQ(state.downstreamSession(), fake_downstream);
++}
++
++TEST(WebTransportSessionStateTest, LivenessFollowsSessionPointers) {
++  WebTransportSessionState state;
++
++  // Liveness is derived from whether the session pointer is set.
++  EXPECT_FALSE(state.upstreamAlive());
++  EXPECT_FALSE(state.downstreamAlive());
++
++  auto* fake_upstream = reinterpret_cast<webtransport::Session*>(0x1234);
++  auto* fake_downstream = reinterpret_cast<webtransport::Session*>(0x5678);
++  state.setUpstreamSession(fake_upstream);
++  state.setDownstreamSession(fake_downstream);
++  EXPECT_TRUE(state.upstreamAlive());
++  EXPECT_TRUE(state.downstreamAlive());
++
++  // Clearing a session pointer (done by the bridge on that side when its session is torn down)
++  // marks that side dead.
++  state.setUpstreamSession(nullptr);
++  EXPECT_FALSE(state.upstreamAlive());
++  EXPECT_TRUE(state.downstreamAlive());
++}
++
++// --- WebTransportSessionBridge ---
++//
++// Since installBridge() now takes the Http::WebTransportSession interface, the session-level
++// forwarding happy path is unit-testable with mocks (see InstallBridgeWiresBothSessionsAndForwards
++// below): the Envoy-level Http::MockWebTransportSession captures the installed visitor and returns
++// a MockRawWebTransportSession from rawWebTransportSession() for the forwarding side. The tests
++// that drive the bridge state directly (selection, closed/dead-peer guards) use sentinel session
++// pointers, which are never dereferenced because every path under test short-circuits.
++
++// Sentinel session pointers; never dereferenced because every path under test short-circuits.
++webtransport::Session* fakeDownstream() { return reinterpret_cast<webtransport::Session*>(0x1234); }
++webtransport::Session* fakeUpstream() { return reinterpret_cast<webtransport::Session*>(0x5678); }
++
++TEST(WebTransportSessionBridgeTest, LocalAndPeerSelectionDependsOnSide) {
++  auto state = std::make_shared<WebTransportSessionState>();
++  state->setDownstreamSession(fakeDownstream());
++  state->setUpstreamSession(fakeUpstream());
++
++  // From the downstream side, "local" is the downstream session and "peer" is the upstream session.
++  WebTransportSessionBridge downstream_bridge(state, /*is_downstream=*/true);
++  EXPECT_EQ(downstream_bridge.localSession(), fakeDownstream());
++  EXPECT_EQ(downstream_bridge.peerSession(), fakeUpstream());
++
++  // From the upstream side, the roles are flipped.
++  WebTransportSessionBridge upstream_bridge(state, /*is_downstream=*/false);
++  EXPECT_EQ(upstream_bridge.localSession(), fakeUpstream());
++  EXPECT_EQ(upstream_bridge.peerSession(), fakeDownstream());
++}
++
++// Destroying a bridge (which happens when its WebTransportHttp3 session is torn down, since the
++// session owns the visitor) clears only that side's session pointer in the shared state, so the
++// surviving peer bridge stops forwarding to the freed session.
++TEST(WebTransportSessionBridgeTest, DestructorClearsOwnSide) {
++  auto state = std::make_shared<WebTransportSessionState>();
++  state->setDownstreamSession(fakeDownstream());
++  state->setUpstreamSession(fakeUpstream());
++
++  {
++    WebTransportSessionBridge downstream_bridge(state, /*is_downstream=*/true);
++    EXPECT_TRUE(state->downstreamAlive());
++  }
++  // The downstream bridge's destructor cleared the downstream side; the upstream side is untouched.
++  EXPECT_FALSE(state->downstreamAlive());
++  EXPECT_TRUE(state->upstreamAlive());
++
++  {
++    WebTransportSessionBridge upstream_bridge(state, /*is_downstream=*/false);
++    EXPECT_TRUE(state->upstreamAlive());
++  }
++  EXPECT_FALSE(state->upstreamAlive());
++}
++
++// OnSessionReady is a no-op log. OnSessionClosed clears this bridge's own side (so the peer stops
++// forwarding into the closed session) but leaves the peer side intact, and is idempotent.
++TEST(WebTransportSessionBridgeTest, ReadyAndClosedCallbacksAreSafe) {
++  NiceMock<MockRawWebTransportSession> peer;
++  EXPECT_CALL(peer, CloseSession(_, _)).Times(1);
++  auto state = std::make_shared<WebTransportSessionState>();
++  state->setDownstreamSession(fakeDownstream());
++  state->setUpstreamSession(&peer);
++  WebTransportSessionBridge bridge(state, /*is_downstream=*/true);
++
++  bridge.OnSessionReady();
++  EXPECT_TRUE(state->downstreamAlive());
++
++  // Closing the downstream session clears the downstream side, not the upstream side.
++  bridge.OnSessionClosed(0, "");
++  EXPECT_FALSE(state->downstreamAlive());
++  EXPECT_TRUE(state->upstreamAlive());
++
++  // Idempotent: a second close is a no-op.
++  bridge.OnSessionClosed(1, "again");
++  EXPECT_FALSE(state->downstreamAlive());
++  EXPECT_TRUE(state->upstreamAlive());
++}
++
++// After OnSessionClosed, incoming-stream and datagram callbacks must short-circuit instead of
++// accepting/dereferencing the (sentinel) sessions: the close clears this side and sets the closed_
++// guard, both of which gate the handlers.
++TEST(WebTransportSessionBridgeTest, IncomingStreamsIgnoredAfterClose) {
++  NiceMock<MockRawWebTransportSession> peer;
++  EXPECT_CALL(peer, CloseSession(_, _)).Times(1);
++  auto state = std::make_shared<WebTransportSessionState>();
++  state->setDownstreamSession(fakeDownstream());
++  state->setUpstreamSession(&peer);
++  WebTransportSessionBridge bridge(state, /*is_downstream=*/true);
++
++  bridge.OnSessionClosed(0, "");
++
++  // Would dereference the sentinel sessions if the closed_ guard were missing.
++  bridge.OnIncomingBidirectionalStreamAvailable();
++  bridge.OnIncomingUnidirectionalStreamAvailable();
++  bridge.OnDatagramReceived("payload");
++}
++
++// When one side has gone away (its session pointer was cleared on stream close), incoming-stream
++// and datagram callbacks must short-circuit instead of dereferencing the dead session.
++TEST(WebTransportSessionBridgeTest, IncomingStreamsIgnoredWhenPeerIsDead) {
++  auto state = std::make_shared<WebTransportSessionState>();
++  // Downstream is live, upstream has closed.
++  state->setDownstreamSession(fakeDownstream());
++  state->setUpstreamSession(nullptr);
++  WebTransportSessionBridge bridge(state, /*is_downstream=*/true);
++
++  bridge.OnIncomingBidirectionalStreamAvailable();
++  bridge.OnIncomingUnidirectionalStreamAvailable();
++  bridge.OnDatagramReceived("payload");
++}
++
++// installBridge is a no-op when either side has no underlying webtransport::Session
++// (rawWebTransportSession() returns null, e.g. the session has already gone away): no visitor is
++// installed on either side.
++TEST(WebTransportSessionBridgeTest, InstallBridgeNoOpWhenASideIsMissing) {
++  NiceMock<MockRawWebTransportSession> raw;
++
++  // Upstream missing.
++  {
++    NiceMock<Http::MockWebTransportSession> downstream;
++    NiceMock<Http::MockWebTransportSession> upstream;
++    ON_CALL(downstream, rawWebTransportSession()).WillByDefault(Return(&raw));
++    ON_CALL(upstream, rawWebTransportSession()).WillByDefault(Return(nullptr));
++    EXPECT_CALL(downstream, setWebTransportVisitor(_)).Times(0);
++    EXPECT_CALL(upstream, setWebTransportVisitor(_)).Times(0);
++    WebTransportSessionBridge::installBridge(downstream, upstream);
++  }
++
++  // Downstream missing.
++  {
++    NiceMock<Http::MockWebTransportSession> downstream;
++    NiceMock<Http::MockWebTransportSession> upstream;
++    ON_CALL(downstream, rawWebTransportSession()).WillByDefault(Return(nullptr));
++    ON_CALL(upstream, rawWebTransportSession()).WillByDefault(Return(&raw));
++    EXPECT_CALL(downstream, setWebTransportVisitor(_)).Times(0);
++    EXPECT_CALL(upstream, setWebTransportVisitor(_)).Times(0);
++    WebTransportSessionBridge::installBridge(downstream, upstream);
++  }
++}
++
++// installBridge wires both sessions: it reads each side's raw webtransport::Session and installs a
++// SessionVisitor (the per-side WebTransportSessionBridge) on each via setWebTransportVisitor. The
++// downstream visitor it installs, when driven with an incoming datagram, forwards it to the
++// *upstream* raw session -- proving the two bridges share state and forward across sides.
++TEST(WebTransportSessionBridgeTest, InstallBridgeWiresBothSessionsAndForwards) {
++  NiceMock<Http::MockWebTransportSession> downstream;
++  NiceMock<Http::MockWebTransportSession> upstream;
++  NiceMock<MockRawWebTransportSession> downstream_raw;
++  NiceMock<MockRawWebTransportSession> upstream_raw;
++  ON_CALL(downstream, rawWebTransportSession()).WillByDefault(Return(&downstream_raw));
++  ON_CALL(upstream, rawWebTransportSession()).WillByDefault(Return(&upstream_raw));
++
++  // Capture the visitor installed on each side so the forwarding can be driven directly.
++  std::unique_ptr<webtransport::SessionVisitor> downstream_visitor;
++  std::unique_ptr<webtransport::SessionVisitor> upstream_visitor;
++  EXPECT_CALL(downstream, setWebTransportVisitor(_))
++      .WillOnce([&](std::unique_ptr<webtransport::SessionVisitor> v) {
++        downstream_visitor = std::move(v);
++      });
++  EXPECT_CALL(upstream, setWebTransportVisitor(_))
++      .WillOnce([&](std::unique_ptr<webtransport::SessionVisitor> v) {
++        upstream_visitor = std::move(v);
++      });
++
++  WebTransportSessionBridge::installBridge(downstream, upstream);
++  ASSERT_NE(downstream_visitor, nullptr);
++  ASSERT_NE(upstream_visitor, nullptr);
++
++  // A datagram received on the downstream session is forwarded to the upstream's raw session.
++  EXPECT_CALL(upstream, sendWebTransportDatagram(absl::string_view("payload")));
++  downstream_visitor->OnDatagramReceived("payload");
++}
++
++// Builds a downstream-side session bridge wired to two mock sessions. Forwarding tests drive the
++// incoming-stream/datagram callbacks and assert the call reaches the peer session.
++struct SessionBridgeHarness {
++  SessionBridgeHarness()
++      : state(std::make_shared<WebTransportSessionState>()), bridge(state, /*is_downstream=*/true) {
++    state->setDownstreamSession(&local_session);
++    state->setUpstreamSession(&peer_session);
++    state->upstream_transport = &peer_transport;
++    ON_CALL(peer_session, CanOpenNextOutgoingBidirectionalStream()).WillByDefault(Return(true));
++    ON_CALL(peer_session, CanOpenNextOutgoingUnidirectionalStream()).WillByDefault(Return(true));
++  }
++  // Configures a freshly-accepted/opened stream pair so bridgeIncomingStream's start() pump drains
++  // cleanly (no data, write side open).
++  void primeStreamPair(MockWebTransportStream& local, MockWebTransportStream& peer) {
++    ON_CALL(local, CanWrite()).WillByDefault(Return(true));
++    ON_CALL(peer, CanWrite()).WillByDefault(Return(true));
++    ON_CALL(local, Read(A<absl::Span<char>>()))
++        .WillByDefault(Return(webtransport::Stream::ReadResult{0, false}));
++    ON_CALL(peer, Read(A<absl::Span<char>>()))
++        .WillByDefault(Return(webtransport::Stream::ReadResult{0, false}));
++  }
++  NiceMock<Http::MockWebTransportSession> peer_transport;
++  NiceMock<MockRawWebTransportSession> local_session;
++  NiceMock<MockRawWebTransportSession> peer_session;
++  WebTransportSessionStateSharedPtr state;
++  WebTransportSessionBridge bridge;
++};
++
++// An incoming bidirectional stream on the local session is accepted, a matching stream is opened on
++// the peer session, and a stream bridge is wired between them (a visitor installed on each).
++TEST(WebTransportSessionBridgeTest, ForwardsIncomingBidirectionalStream) {
++  SessionBridgeHarness h;
++  NiceMock<MockWebTransportStream> local_stream;
++  NiceMock<MockWebTransportStream> peer_stream;
++  h.primeStreamPair(local_stream, peer_stream);
++
++  // One stream available, then the queue drains (nullptr ends the accept loop).
++  EXPECT_CALL(h.local_session, AcceptIncomingBidirectionalStream())
++      .WillOnce(Return(&local_stream))
++      .WillOnce(Return(nullptr));
++  EXPECT_CALL(h.peer_session, OpenOutgoingBidirectionalStream()).WillOnce(Return(&peer_stream));
++  EXPECT_CALL(local_stream, SetVisitor(_));
++  EXPECT_CALL(peer_stream, SetVisitor(_));
++
++  h.bridge.OnIncomingBidirectionalStreamAvailable();
++}
++
++TEST(WebTransportSessionBridgeTest, ForwardsIncomingUnidirectionalStream) {
++  SessionBridgeHarness h;
++  NiceMock<MockWebTransportStream> local_stream;
++  NiceMock<MockWebTransportStream> peer_stream;
++  h.primeStreamPair(local_stream, peer_stream);
++
++  EXPECT_CALL(h.local_session, AcceptIncomingUnidirectionalStream())
++      .WillOnce(Return(&local_stream))
++      .WillOnce(Return(nullptr));
++  EXPECT_CALL(h.peer_session, OpenOutgoingUnidirectionalStream()).WillOnce(Return(&peer_stream));
++  EXPECT_CALL(local_stream, SetVisitor(_));
++  EXPECT_CALL(peer_stream, SetVisitor(_));
++
++  h.bridge.OnIncomingUnidirectionalStreamAvailable();
++}
++
++// If the peer session cannot open a matching stream, the accepted local stream is reset (and no
++// bridge/visitor is wired).
++TEST(WebTransportSessionBridgeTest, ResetsLocalStreamWhenPeerCannotOpen) {
++  SessionBridgeHarness h;
++  NiceMock<MockWebTransportStream> local_stream;
++
++  EXPECT_CALL(h.local_session, AcceptIncomingBidirectionalStream())
++      .WillOnce(Return(&local_stream))
++      .WillOnce(Return(nullptr));
++  EXPECT_CALL(h.peer_session, OpenOutgoingBidirectionalStream()).WillOnce(Return(nullptr));
++  EXPECT_CALL(local_stream, ResetWithUserCode(0));
++  EXPECT_CALL(local_stream, SetVisitor(_)).Times(0);
++
++  h.bridge.OnIncomingBidirectionalStreamAvailable();
++}
++
++// A datagram received on the local session is forwarded to the peer session.
++TEST(WebTransportSessionBridgeTest, ForwardsDatagram) {
++  SessionBridgeHarness h;
++  EXPECT_CALL(h.peer_transport, sendWebTransportDatagram(absl::string_view("payload")));
++
++  h.bridge.OnDatagramReceived("payload");
++}
++
++TEST(WebTransportSessionBridgeTest, DoesNotConsumeStreamWhenPeerFlowControlled) {
++  SessionBridgeHarness h;
++  EXPECT_CALL(h.peer_session, CanOpenNextOutgoingBidirectionalStream()).WillOnce(Return(false));
++  EXPECT_CALL(h.local_session, AcceptIncomingBidirectionalStream()).Times(0);
++  h.bridge.OnIncomingBidirectionalStreamAvailable();
++}
++
++TEST(WebTransportStreamBridgeTest, ClosedSessionStopsExistingStreamTransfer) {
++  NiceMock<MockWebTransportStream> local;
++  NiceMock<MockWebTransportStream> peer;
++  auto bridge = std::make_shared<WebTransportStreamBridge>(&local, &peer, []() { return false; });
++  EXPECT_CALL(local, Read(A<absl::Span<char>>())).Times(0);
++  EXPECT_CALL(peer, Read(A<absl::Span<char>>())).Times(0);
++  bridge->start();
++}
++
++TEST(WebTransportSessionBridgeTest, PolicyGuardStopsCallbacksBeforeConnectReset) {
++  SessionBridgeHarness h;
++  h.state->downstream_allowed = std::make_shared<bool>(false);
++  EXPECT_CALL(h.local_session, AcceptIncomingBidirectionalStream()).Times(0);
++  EXPECT_CALL(h.local_session, AcceptIncomingUnidirectionalStream()).Times(0);
++  EXPECT_CALL(h.peer_transport, sendWebTransportDatagram(_)).Times(0);
++  h.bridge.OnIncomingBidirectionalStreamAvailable();
++  h.bridge.OnIncomingUnidirectionalStreamAvailable();
++  h.bridge.OnDatagramReceived("must not leave the proxy");
++}
++
++} // namespace
++} // namespace Quic
++} // namespace Envoy
+--- a/test/integration/BUILD
++++ b/test/integration/BUILD
+@@ -2815,6 +2815,30 @@
+ )
+ 
+ envoy_cc_test(
++    name = "web_transport_integration_test",
++    size = "large",
++    srcs = select({
++        "//bazel:disable_http3": [],
++        "//conditions:default": ["web_transport_integration_test.cc"],
++    }),
++    data = ["//test/config/integration/certs"],
++    rbe_pool = "6gig",
++    deps = envoy_select_enable_http3([
++        ":http_integration_lib",
++        ":http_protocol_integration_lib",
++        "//source/common/quic:active_quic_listener_lib",
++        "//source/common/quic:client_connection_factory_lib",
++        "//source/common/quic:quic_client_factory_lib",
++        "//source/common/quic:quic_server_factory_lib",
++        "//source/common/quic:quic_transport_socket_factory_lib",
++        "//test/test_common:utility_lib",
++        "@com_github_google_quiche//:quiche_common_buffer_allocator_lib",
++        "@com_github_google_quiche//:quiche_web_transport_web_transport_lib",
++        "@envoy_api//envoy/extensions/filters/network/http_connection_manager/v3:pkg_cc_proto",
++    ]),
++)
++
++envoy_cc_test(
+     name = "original_ip_detection_integration_test",
+     size = "large",
+     srcs = [
+--- a/test/integration/fake_upstream.h
++++ b/test/integration/fake_upstream.h
+@@ -118,6 +118,12 @@
+   bool receivedData() { return received_data_; }
+   Http::Http1StreamEncoderOptionsOptRef http1StreamEncoderOptions() {
+     return encoder_.http1StreamEncoderOptions();
++  }
++  // Exposes the underlying WebTransport session of this stream, if any (HTTP/3 only). Lets tests
++  // drive a negotiated WebTransport session on the upstream side: install a visitor, open streams,
++  // send/receive data and datagrams. Empty OptRef for non-WebTransport streams.
++  OptRef<Http::WebTransportSession> webTransportSession() {
++    return encoder_.getStream().webTransportSession();
+   }
+   void
+   sendLocalReply(Http::Code code, absl::string_view body,
+--- /dev/null
++++ b/test/integration/web_transport_integration_test.cc
+@@ -0,0 +1,318 @@
++#include <algorithm>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "test/integration/http_protocol_integration.h"
++#include "test/test_common/utility.h"
++
++#include "absl/synchronization/notification.h"
++#include "absl/time/time.h"
++#include "gtest/gtest.h"
++#include "quiche/common/quiche_buffer_allocator.h"
++#include "quiche/common/simple_buffer_allocator.h"
++#include "quiche/web_transport/web_transport.h"
++
++namespace Envoy {
++namespace {
++
++// Echoes everything read on a WebTransport stream back out the same (bidirectional) stream. Used on
++// the upstream (fake) side as the "application" the proxy bridges to. Runs entirely on the upstream
++// dispatcher thread (all webtransport callbacks for a session fire on that session's thread).
++class EchoStreamVisitor : public webtransport::StreamVisitor {
++public:
++  explicit EchoStreamVisitor(webtransport::Stream* stream) : stream_(stream) {}
++
++  void OnCanRead() override {
++    std::string data;
++    webtransport::Stream::ReadResult result = stream_->Read(&data);
++    (void)result;
++    pending_.append(data);
++    flush();
++  }
++  void OnCanWrite() override { flush(); }
++  void OnResetStreamReceived(webtransport::StreamErrorCode /*error*/) override {}
++  void OnStopSendingReceived(webtransport::StreamErrorCode /*error*/) override {}
++  void OnWriteSideInDataRecvdState() override {}
++
++private:
++  void flush() {
++    while (!pending_.empty() && stream_->CanWrite()) {
++      quiche::QuicheMemSlice slice(
++          quiche::QuicheBuffer::Copy(quiche::SimpleBufferAllocator::Get(), pending_));
++      absl::Span<quiche::QuicheMemSlice> span(&slice, 1);
++      if (!stream_->Writev(span, quiche::StreamWriteOptions()).ok()) {
++        return;
++      }
++      pending_.clear();
++    }
++  }
++
++  webtransport::Stream* stream_;
++  std::string pending_;
++};
++
++// Session visitor installed on the upstream WebTransport session: accepts incoming bidirectional
++// streams (opened by the proxy's bridge) and wires an echo visitor onto each.
++class EchoSessionVisitor : public webtransport::SessionVisitor {
++public:
++  explicit EchoSessionVisitor(webtransport::Session* session) : session_(session) {}
++
++  void OnIncomingBidirectionalStreamAvailable() override {
++    while (webtransport::Stream* stream = session_->AcceptIncomingBidirectionalStream()) {
++      auto visitor = std::make_unique<EchoStreamVisitor>(stream);
++      EchoStreamVisitor* raw = visitor.get();
++      stream->SetVisitor(std::move(visitor));
++      // Drain anything that arrived before the visitor was installed.
++      raw->OnCanRead();
++    }
++  }
++  void OnSessionReady() override {}
++  void OnSessionClosed(webtransport::SessionErrorCode /*error_code*/,
++                       const std::string& /*error_message*/) override {}
++  void OnIncomingUnidirectionalStreamAvailable() override {}
++  void OnDatagramReceived(absl::string_view datagram) override {
++    session_->SendOrQueueDatagram(datagram);
++  }
++  void OnCanCreateNewOutgoingBidirectionalStream() override {}
++  void OnCanCreateNewOutgoingUnidirectionalStream() override {}
++
++private:
++  webtransport::Session* session_;
++};
++
++// Stream visitor installed on the downstream client's opened stream: captures the echoed bytes.
++class CaptureStreamVisitor : public webtransport::StreamVisitor {
++public:
++  explicit CaptureStreamVisitor(webtransport::Stream* stream) : stream_(stream) {}
++
++  void OnCanRead() override {
++    std::string data;
++    webtransport::Stream::ReadResult result = stream_->Read(&data);
++    (void)result;
++    received_.append(data);
++  }
++  void OnCanWrite() override {}
++  void OnResetStreamReceived(webtransport::StreamErrorCode /*error*/) override {}
++  void OnStopSendingReceived(webtransport::StreamErrorCode /*error*/) override {}
++  void OnWriteSideInDataRecvdState() override {}
++
++  const std::string& received() const { return received_; }
++
++private:
++  webtransport::Stream* stream_;
++  std::string received_;
++};
++
++// Session visitor installed on the downstream client's session: captures echoed datagrams.
++class CaptureSessionVisitor : public webtransport::SessionVisitor {
++public:
++  void OnDatagramReceived(absl::string_view datagram) override {
++    datagrams_.emplace_back(datagram);
++  }
++  void OnSessionReady() override {}
++  void OnSessionClosed(webtransport::SessionErrorCode /*error_code*/,
++                       const std::string& /*error_message*/) override {}
++  void OnIncomingBidirectionalStreamAvailable() override {}
++  void OnIncomingUnidirectionalStreamAvailable() override {}
++  void OnCanCreateNewOutgoingBidirectionalStream() override {}
++  void OnCanCreateNewOutgoingUnidirectionalStream() override {}
++
++  bool received(absl::string_view datagram) const {
++    return std::find(datagrams_.begin(), datagrams_.end(), std::string(datagram)) !=
++           datagrams_.end();
++  }
++
++private:
++  std::vector<std::string> datagrams_;
++};
++
++// End-to-end WebTransport bridging: a real HTTP/3 client opens a WebTransport CONNECT that Envoy
++// proxies to an HTTP/3 upstream, and the per-session bridge forwards WebTransport streams/datagrams
++// between the two QUIC sessions. Pinned to HTTP/3 on both hops (WebTransport is HTTP/3 only).
++class WebTransportIntegrationTest : public HttpProtocolIntegrationTest {
++public:
++  void initialize() override {
++    config_helper_.addRuntimeOverride("envoy.reloadable_features.quic_support_web_transport",
++                                      "true");
++    config_helper_.addConfigModifier(
++        [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
++               hcm) {
++          // A WebTransport extended CONNECT is normalized to the HTTP/1 upgrade form (GET + :path +
++          // "Upgrade: webtransport"), so it is matched by a normal path match, NOT a
++          // connect_matcher. Forward it (do not terminate) by enabling the "webtransport" upgrade
++          // on the route and the connection manager.
++          auto* route = hcm.mutable_route_config()->mutable_virtual_hosts(0)->mutable_routes(0);
++          route->mutable_match()->set_prefix("/");
++          route->mutable_route()->add_upgrade_configs()->set_upgrade_type("webtransport");
++
++          hcm.add_upgrade_configs()->set_upgrade_type("webtransport");
++          hcm.mutable_http3_protocol_options()->set_allow_extended_connect(true);
++        });
++    HttpProtocolIntegrationTest::initialize();
++  }
++
++  // WebTransport request in HTTP/1 upgrade form; the H/3 client codec converts it to the extended
++  // CONNECT (:method CONNECT, :protocol webtransport) on the wire.
++  Http::TestRequestHeaderMapImpl webTransportHeaders() {
++    // The authority must match the upstream test cert (*.lyft.com): configureUpstreamTls enables
++    // auto_sni, so the upstream TLS SNI is derived from :authority. A non-matching name fails the
++    // upstream certificate verification.
++    return {{":method", "GET"},        {":path", "/"},       {"upgrade", "webtransport"},
++            {"connection", "upgrade"}, {":scheme", "https"}, {":authority", "foo.lyft.com"}};
++  }
++
++  // Installs the echo application on the upstream WebTransport session. Runs on the upstream
++  // dispatcher thread, where that session's QUICHE callbacks fire. Returns false if the upstream
++  // stream has no WebTransport session. upstream_request_ must already have headers.
++  bool installUpstreamEcho() {
++    absl::Notification done;
++    bool ok = false;
++    fake_upstreams_[0]->runOnDispatcherThread([&]() {
++      OptRef<Http::WebTransportSession> session = upstream_request_->webTransportSession();
++      if (session.has_value() && session->rawWebTransportSession() != nullptr) {
++        session->setWebTransportVisitor(
++            std::make_unique<EchoSessionVisitor>(session->rawWebTransportSession()));
++        ok = true;
++      }
++      done.Notify();
++    });
++    EXPECT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(15)));
++    return ok;
++  }
++};
++
++INSTANTIATE_TEST_SUITE_P(Protocols, WebTransportIntegrationTest,
++                         testing::ValuesIn(HttpProtocolIntegrationTest::getProtocolTestParams(
++                             {Http::CodecType::HTTP3}, {Http::CodecType::HTTP3})),
++                         HttpProtocolIntegrationTest::protocolTestParamsToString);
++
++// A downstream WebTransport CONNECT is forwarded to the upstream, and once both sides answer, the
++// bridge has a live WebTransport session on each end.
++TEST_P(WebTransportIntegrationTest, BridgesWebTransportSessions) {
++  initialize();
++
++  codec_client_ = makeHttpConnection(lookupPort("http"));
++  auto encoder_decoder = codec_client_->startRequest(webTransportHeaders());
++  request_encoder_ = &encoder_decoder.first;
++  auto response = std::move(encoder_decoder.second);
++
++  // The CONNECT is forwarded upstream as an extended CONNECT.
++  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
++  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
++  ASSERT_TRUE(upstream_request_->waitForHeadersComplete());
++  EXPECT_EQ(upstream_request_->headers().getUpgradeValue(), "webtransport");
++
++  // The upstream accepts the WebTransport session and installs the echo application on it.
++  ASSERT_TRUE(installUpstreamEcho());
++
++  // Respond 2xx so the bridge is installed at the downstream client side too.
++  upstream_request_->encodeHeaders(default_response_headers_, false);
++  response->waitForHeaders();
++
++  // The downstream client now has a live WebTransport session.
++  OptRef<Http::WebTransportSession> client_session =
++      request_encoder_->getStream().webTransportSession();
++  ASSERT_TRUE(client_session.has_value());
++  ASSERT_NE(client_session->rawWebTransportSession(), nullptr);
++
++  cleanupUpstreamAndDownstream();
++}
++
++// Opens a bidirectional WebTransport stream on the downstream client, writes data, and verifies the
++// bytes are forwarded through Envoy's bridge to the upstream echo application and back.
++TEST_P(WebTransportIntegrationTest, EchoesBidirectionalStreamThroughBridge) {
++  initialize();
++
++  codec_client_ = makeHttpConnection(lookupPort("http"));
++  auto encoder_decoder = codec_client_->startRequest(webTransportHeaders());
++  request_encoder_ = &encoder_decoder.first;
++  auto response = std::move(encoder_decoder.second);
++
++  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
++  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
++  ASSERT_TRUE(upstream_request_->waitForHeadersComplete());
++
++  ASSERT_TRUE(installUpstreamEcho());
++
++  upstream_request_->encodeHeaders(default_response_headers_, false);
++  response->waitForHeaders();
++
++  // Open a bidirectional stream on the client session and write a payload.
++  webtransport::Session* client_session =
++      request_encoder_->getStream().webTransportSession()->rawWebTransportSession();
++  ASSERT_NE(client_session, nullptr);
++  webtransport::Stream* client_stream = client_session->OpenOutgoingBidirectionalStream();
++  ASSERT_NE(client_stream, nullptr);
++  client_stream->SetVisitor(std::make_unique<CaptureStreamVisitor>(client_stream));
++  auto* capture_ptr = static_cast<CaptureStreamVisitor*>(client_stream->visitor());
++
++  const std::string payload = "hello webtransport";
++  quiche::QuicheMemSlice slice(
++      quiche::QuicheBuffer::Copy(quiche::SimpleBufferAllocator::Get(), payload));
++  absl::Span<quiche::QuicheMemSlice> span(&slice, 1);
++  ASSERT_TRUE(client_stream->Writev(span, quiche::StreamWriteOptions()).ok());
++
++  // Pump the client event loop until the echo arrives (the bytes traverse client -> Envoy bridge ->
++  // upstream echo -> back).
++  Event::TestTimeSystem& time_system = timeSystem();
++  bool echoed = false;
++  for (int i = 0; i < 200 && !echoed; i++) {
++    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
++    echoed = capture_ptr->received() == payload;
++    if (!echoed) {
++      time_system.advanceTimeWait(std::chrono::milliseconds(10));
++    }
++  }
++  EXPECT_TRUE(echoed) << "received: '" << capture_ptr->received() << "'";
++
++  cleanupUpstreamAndDownstream();
++}
++
++// Sends a WebTransport datagram from the downstream client and verifies it is forwarded through
++// Envoy's bridge to the upstream echo application and back.
++TEST_P(WebTransportIntegrationTest, EchoesDatagramThroughBridge) {
++  initialize();
++
++  codec_client_ = makeHttpConnection(lookupPort("http"));
++  auto encoder_decoder = codec_client_->startRequest(webTransportHeaders());
++  request_encoder_ = &encoder_decoder.first;
++  auto response = std::move(encoder_decoder.second);
++
++  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
++  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
++  ASSERT_TRUE(upstream_request_->waitForHeadersComplete());
++
++  ASSERT_TRUE(installUpstreamEcho());
++
++  upstream_request_->encodeHeaders(default_response_headers_, false);
++  response->waitForHeaders();
++
++  // Install a session visitor on the client session to capture echoed datagrams.
++  OptRef<Http::WebTransportSession> client = request_encoder_->getStream().webTransportSession();
++  ASSERT_TRUE(client.has_value());
++  ASSERT_NE(client->rawWebTransportSession(), nullptr);
++  auto capture = std::make_unique<CaptureSessionVisitor>();
++  auto* capture_ptr = capture.get();
++  client->setWebTransportVisitor(std::move(capture));
++  webtransport::Session* client_session = client->rawWebTransportSession();
++
++  // Datagrams are unreliable, so resend each round until the echo is observed (or we give up).
++  // Early datagrams may be dropped before the session/bridge is fully ready.
++  const std::string payload = "hello datagram";
++  bool echoed = false;
++  for (int i = 0; i < 200 && !echoed; i++) {
++    client_session->SendOrQueueDatagram(payload);
++    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
++    echoed = capture_ptr->received(payload);
++    if (!echoed) {
++      timeSystem().advanceTimeWait(std::chrono::milliseconds(10));
++    }
++  }
++  EXPECT_TRUE(echoed);
++
++  cleanupUpstreamAndDownstream();
++}
++
++} // namespace
++} // namespace Envoy
+--- a/test/mocks/http/BUILD
++++ b/test/mocks/http/BUILD
+@@ -24,6 +24,16 @@
+     hdrs = ["api_listener.h"],
+     deps = [
+         "//envoy/http:api_listener_interface",
++    ],
++)
++
++envoy_cc_mock(
++    name = "webtransport_mocks",
++    srcs = ["webtransport.cc"],
++    hdrs = ["webtransport.h"],
++    deps = [
++        "//envoy/http:codec_interface",
++        "@com_github_google_quiche//:quiche_web_transport_web_transport_lib",
+     ],
+ )
+ 
+--- a/test/mocks/http/stream_decoder.h
++++ b/test/mocks/http/stream_decoder.h
+@@ -66,6 +66,7 @@
+   MOCK_METHOD(void, decode1xxHeaders_, (ResponseHeaderMapPtr & headers));
+   MOCK_METHOD(void, decodeHeaders_, (ResponseHeaderMapPtr & headers, bool end_stream));
+   MOCK_METHOD(void, decodeTrailers_, (ResponseTrailerMapPtr & trailers));
++  MOCK_METHOD(OptRef<WebTransportSession>, downstreamWebTransportSession, (), (override));
+   MOCK_METHOD(void, dumpState, (std::ostream&, int), (const));
+ };
+ 
+--- /dev/null
++++ b/test/mocks/http/webtransport.cc
+@@ -0,0 +1,16 @@
++#include "test/mocks/http/webtransport.h"
++
++namespace Envoy {
++namespace Http {
++
++MockWebTransportSession::MockWebTransportSession() = default;
++MockWebTransportSession::~MockWebTransportSession() = default;
++
++MockWebTransportStream::MockWebTransportStream() = default;
++MockWebTransportStream::~MockWebTransportStream() = default;
++
++MockRawWebTransportSession::MockRawWebTransportSession() = default;
++MockRawWebTransportSession::~MockRawWebTransportSession() = default;
++
++} // namespace Http
++} // namespace Envoy
+--- /dev/null
++++ b/test/mocks/http/webtransport.h
+@@ -0,0 +1,90 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <optional>
++#include <string>
++
++#include "envoy/http/codec.h"
++
++#include "gmock/gmock.h"
++#include "quiche/web_transport/web_transport.h"
++
++namespace Envoy {
++namespace Http {
++
++// Reusable mock for the Http::WebTransportSession interface (envoy/http/codec.h). Lives in its own
++// target rather than the broad http_mocks so consumers that do not need WebTransport (and the
++// QUICHE dependency it pulls in) are unaffected.
++class MockWebTransportSession : public WebTransportSession {
++public:
++  MockWebTransportSession();
++  ~MockWebTransportSession() override;
++
++  MOCK_METHOD(void, setWebTransportVisitor,
++              (std::unique_ptr<webtransport::SessionVisitor> visitor));
++  MOCK_METHOD(webtransport::Session*, rawWebTransportSession, ());
++  MOCK_METHOD(void, sendWebTransportDatagram, (absl::string_view), (override));
++};
++
++// Mock of QUICHE webtransport::Stream, for exercising the stream-level bridge.
++class MockWebTransportStream : public webtransport::Stream {
++public:
++  MockWebTransportStream();
++  ~MockWebTransportStream() override;
++
++  MOCK_METHOD(webtransport::Stream::ReadResult, Read, (absl::Span<char> buffer), (override));
++  MOCK_METHOD(webtransport::Stream::ReadResult, Read, (std::string * output), (override));
++  MOCK_METHOD(size_t, ReadableBytes, (), (const, override));
++  MOCK_METHOD(webtransport::Stream::PeekResult, PeekNextReadableRegion, (), (const, override));
++  MOCK_METHOD(bool, SkipBytes, (size_t bytes), (override));
++  MOCK_METHOD(absl::Status, Writev,
++              (absl::Span<quiche::QuicheMemSlice> data,
++               const quiche::StreamWriteOptions& options),
++              (override));
++  MOCK_METHOD(bool, CanWrite, (), (const, override));
++  MOCK_METHOD(void, SetPriority, (const webtransport::StreamPriority& priority), (override));
++  MOCK_METHOD(void, ResetWithUserCode, (webtransport::StreamErrorCode error), (override));
++  MOCK_METHOD(void, SendStopSending, (webtransport::StreamErrorCode error), (override));
++  MOCK_METHOD(void, ResetDueToInternalError, (), (override));
++  MOCK_METHOD(void, MaybeResetDueToStreamObjectGone, (), (override));
++  MOCK_METHOD(void, SetVisitor, (std::unique_ptr<webtransport::StreamVisitor> visitor), (override));
++  MOCK_METHOD(webtransport::StreamVisitor*, visitor, (), (override));
++  MOCK_METHOD(webtransport::StreamId, GetStreamId, (), (const, override));
++};
++
++// Mock of QUICHE webtransport::Session, for exercising the session-level bridge's forwarding. The
++// bridge only ever drives the webtransport::Session interface, so a mock of it is sufficient to
++// exercise the forwarding logic without a live quic::WebTransportHttp3. Named with a "Raw" prefix
++// to distinguish it from MockWebTransportSession, which mocks the Envoy-level
++// Http::WebTransportSession interface used by installBridge().
++class MockRawWebTransportSession : public webtransport::Session {
++public:
++  MockRawWebTransportSession();
++  ~MockRawWebTransportSession() override;
++
++  MOCK_METHOD(void, CloseSession,
++              (webtransport::SessionErrorCode error_code, absl::string_view error_message),
++              (override));
++  MOCK_METHOD(webtransport::Stream*, AcceptIncomingBidirectionalStream, (), (override));
++  MOCK_METHOD(webtransport::Stream*, AcceptIncomingUnidirectionalStream, (), (override));
++  MOCK_METHOD(bool, CanOpenNextOutgoingBidirectionalStream, (), (override));
++  MOCK_METHOD(bool, CanOpenNextOutgoingUnidirectionalStream, (), (override));
++  MOCK_METHOD(webtransport::Stream*, OpenOutgoingBidirectionalStream, (), (override));
++  MOCK_METHOD(webtransport::Stream*, OpenOutgoingUnidirectionalStream, (), (override));
++  MOCK_METHOD(webtransport::Stream*, GetStreamById, (webtransport::StreamId id), (override));
++  MOCK_METHOD(webtransport::DatagramStatus, SendOrQueueDatagram, (absl::string_view datagram),
++              (override));
++  MOCK_METHOD(uint64_t, GetMaxDatagramSize, (), (const, override));
++  MOCK_METHOD(void, SetDatagramMaxTimeInQueue, (absl::Duration max_time_in_queue), (override));
++  MOCK_METHOD(webtransport::DatagramStats, GetDatagramStats, (), (override));
++  MOCK_METHOD(webtransport::SessionStats, GetSessionStats, (), (override));
++  MOCK_METHOD(void, NotifySessionDraining, (), (override));
++  MOCK_METHOD(void, SetOnDraining, (quiche::SingleUseCallback<void()> callback), (override));
++  MOCK_METHOD(std::optional<std::string>, GetNegotiatedSubprotocol, (), // NOLINT(std::optional)
++              (const, override));
++};
++
++} // namespace Http
++} // namespace Envoy
+--- a/tools/spelling/spelling_dictionary.txt
++++ b/tools/spelling/spelling_dictionary.txt
+@@ -82,6 +82,10 @@
+ SION
+ TRA
+ Websockets
++webtransport
++WEBTRANSPORT
++signalling
++signalled
+ abc
+ abcd
+ abd
+@@ -124,6 +128,7 @@
+ NAK
+ OWS
+ Preconnecting
++CONNECT
+ RCVBUF
+ RTCP
+ RTLD
+@@ -1525,6 +1530,7 @@
+ unix
+ unref
+ unreferenced
++dereferenced
+ unzigzag
+ upcasts
+ upstreams

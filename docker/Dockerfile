@@ -32,16 +32,32 @@ RUN --mount=type=cache,target=/root/.cache \
     bazel --host_jvm_args=-Xmx1536m test -c opt --config="${BAZEL_CONFIG}" --jobs="${TEST_JOBS}" \
     --test_output=errors //test/...
 
-FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac
+FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac AS runtime-base
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl libc++1-19 libc++abi1-19 libunwind-19 && \
     rm -rf /var/lib/apt/lists/* && mkdir -p /etc/envoy && \
     useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin envoy
-COPY --from=verification /usr/local/bin/openzta-envoy /usr/local/bin/envoy
 USER 10001:10001
 EXPOSE 8443 8443/udp 2222 2525
 HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
   CMD curl --fail --silent --unix-socket /tmp/envoy-admin.sock http://localhost/ready || exit 1
 ENTRYPOINT ["/usr/local/bin/envoy"]
 CMD ["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
+
+# Explicit opt-out target for an authorized deferred C++ run. It still requires
+# a real binary build; release evidence must record the missing C++ suite.
+FROM runtime-base AS runtime-candidate
+ARG BUILD_SCM_REVISION
+LABEL org.opencontainers.image.title="OpenZTA Proxy" \
+      org.opencontainers.image.revision="${BUILD_SCM_REVISION}" \
+      ru.openzta.verification.cpp="deferred"
+COPY --from=builder /usr/local/bin/openzta-envoy /usr/local/bin/envoy
+
+# Default target retains the full C++ gate for normal release builds.
+FROM runtime-base AS verified
+ARG BUILD_SCM_REVISION
+LABEL org.opencontainers.image.title="OpenZTA Proxy" \
+      org.opencontainers.image.revision="${BUILD_SCM_REVISION}" \
+      ru.openzta.verification.cpp="passed"
+COPY --from=verification /usr/local/bin/openzta-envoy /usr/local/bin/envoy

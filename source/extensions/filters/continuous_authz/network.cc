@@ -2,6 +2,7 @@
 
 #include "source/common/tracing/null_span_impl.h"
 #include "source/common/common/logger.h"
+#include "source/common/network/utility.h"
 #include "source/common/stream_info/bool_accessor_impl.h"
 #include "source/extensions/filters/common/ext_authz/check_request_utils.h"
 
@@ -80,6 +81,17 @@ void NetworkContinuousAuthz::startCheck() {
   }
   Authz::CheckRequestUtils::createTcpCheck(callbacks_, snapshot_, true,
                                            config_->includeTLSSession(), config_->destinationLabels(), {});
+  // Listener filters may restore localAddress() from a PROXY header. Policy
+  // selection must use the actual listener, never a destination supplied by a
+  // client. Preserve that binding in the snapshot used by every recheck.
+  const auto& listener_address = callbacks_->connection().connectionInfoProvider().directLocalAddress();
+  if (!listener_address) {
+    revoke("openzta_listener_address_required");
+    return;
+  }
+  Network::Utility::addressToProtobufAddress(
+    *listener_address,
+    *snapshot_.mutable_attributes()->mutable_destination()->mutable_address());
   if (snapshot_.attributes().source().certificate().empty()) {
     revoke("openzta_client_certificate_required");
     return;

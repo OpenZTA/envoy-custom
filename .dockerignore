@@ -3,3 +3,8 @@ bazel-*
 clang.bazelrc
 .artifacts
 test/acceptance
+
+.native-*
+**/__pycache__
+**/*.key
+**/private/

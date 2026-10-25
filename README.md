@@ -102,6 +102,25 @@ and a bounded loopback adapter for ordinary UDP applications. Its deployment
 declares `LAB_CONNECT_UDP_ENABLED=true` only with the verified native profile;
 the flag is a deployment declaration, not a substitute for wire acceptance.
 
+## WebTransport and production deployment
+
+Patch `0012-webtransport.patch` adds a WebTransport HTTP/3 session bridge with
+BIDI/UNI streams, datagrams, stream-credit wakeups, service-certificate upstream
+mTLS, and continuous authorization of the parent CONNECT session. The runtime
+flag is disabled by default. The supported profile uses one WebTransport session
+per QUIC connection and requires `max_requests_per_connection: 1` on the upstream
+cluster. See [the backport profile](patches/envoy/WEBTRANSPORT.md) for negotiation,
+key-provider restrictions and the exact runtime acceptance requirement.
+
+Deployment generation, certificate/configuration validation, bounded container
+limits, release evidence and rollback instructions are in
+[deploy/production/README.ru.md](deploy/production/README.ru.md) and
+[the operations guide](deploy/production/OPERATIONS.ru.md). The generator validates
+the actual supplied binary and immutable image. Release export requires runtime
+evidence for that image and the current patch hashes. A candidate with the full
+C++ suite explicitly deferred retains that status in its release metadata;
+configuration validation and LAB feature flags do not establish runtime support.
+
 ## Building
 
 Follow the [Envoy Bazel Install](https://github.com/envoyproxy/envoy/blob/main/bazel/README.md#installing-bazelisk-as-bazel) docs to install bazel.

@@ -41,6 +41,14 @@ Http::FilterHeadersStatus HttpContinuousAuthz::decodeHeaders(Http::RequestHeader
                                Grpc::Status::Unauthenticated, "openzta_unverified_client_certificate");
     return Http::FilterHeadersStatus::StopIteration;
   }
+  const bool webtransport = headers.getProtocolValue() == "webtransport" ||
+      headers.getUpgradeValue() == "webtransport" ||
+      headers.getProtocolValue() == "webtransport-h3" || headers.getUpgradeValue() == "webtransport-h3";
+  if (webtransport && !callbacks_->webTransportSession().has_value()) {
+    callbacks_->sendLocalReply(Http::Code::BadRequest, "OpenZTA: negotiated HTTP/3 WebTransport required", nullptr,
+                               Grpc::Status::InvalidArgument, "openzta_webtransport_negotiation_required");
+    return Http::FilterHeadersStatus::StopIteration;
+  }
   // Bind authorization to the configured application, not a caller-controlled
   // Host routed to an unrelated, fixed upstream. Multi-resource gateways must
   // declare the binding on the selected route using trusted configuration.
@@ -65,7 +73,7 @@ Http::FilterHeadersStatus HttpContinuousAuthz::decodeHeaders(Http::RequestHeader
   // which share a connection with other, independently authorized resources.
   headers.remove(RecheckHeader);
   headers.setCopy(OriginalHost, resource);
-  headers.setCopy(OriginalMethod, headers.getMethodValue());
+  headers.setCopy(OriginalMethod, webtransport ? "CONNECT" : headers.getMethodValue());
   headers.setCopy(OriginalPath, headers.getPathValue());
   const std::string session_id = fmt::format("{:016x}{:016x}",
                                              context_.api().randomGenerator().random(), context_.api().randomGenerator().random());
@@ -82,6 +90,7 @@ Http::FilterHeadersStatus HttpContinuousAuthz::decodeHeaders(Http::RequestHeader
     callbacks_, headers, std::move(extensions), {}, {}, snapshot_, 0, false, false,
     true, authorization_config_->includeTLSSession(), authorization_config_->destinationLabels(),
     authorization_config_->allowedHeadersMatcher(), authorization_config_->disallowedHeadersMatcher());
+  if (webtransport) { snapshot_.mutable_attributes()->mutable_request()->mutable_http()->set_method("CONNECT"); }
   const auto& certificate = snapshot_.attributes().source().certificate();
   if (certificate.empty()) {
     callbacks_->sendLocalReply(Http::Code::Forbidden, "OpenZTA: client certificate required", nullptr,
@@ -117,6 +126,11 @@ void HttpContinuousAuthz::onComplete(Authz::ResponsePtr&& response) {
 }
 
 void HttpContinuousAuthz::onDestroy() {
+  if (callbacks_ != nullptr) {
+    if (auto session = callbacks_->webTransportSession(); session.has_value()) {
+      session->disableWebTransportForwarding();
+    }
+  }
   if (controller_) {
     controller_->stop();
   }
@@ -124,6 +138,12 @@ void HttpContinuousAuthz::onDestroy() {
 }
 
 void HttpContinuousAuthz::revoke(absl::string_view reason) {
+  if (auto session = callbacks_->webTransportSession(); session.has_value()) {
+    session->disableWebTransportForwarding();
+  }
+  Protobuf::Struct metadata;
+  (*metadata.mutable_fields())["initial_authorized"].set_bool_value(false);
+  callbacks_->streamInfo().setDynamicMetadata("openzta.continuous_authz", metadata);
   auto& info = callbacks_->streamInfo();
   info.setResponseFlag(StreamInfo::CoreResponseFlag::UnauthorizedExternalService);
   info.setResponseCodeDetails(reason);

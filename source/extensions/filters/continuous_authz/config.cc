@@ -55,6 +55,14 @@ public:
     (*normalized.mutable_attributes()->mutable_context_extensions())["openzta.resource_host"] = resource;
     (*normalized.mutable_attributes()->mutable_destination()->mutable_labels())["resource_host"] = resource;
     auto* http = normalized.mutable_attributes()->mutable_request()->mutable_http();
+    // UHV represents extended CONNECT internally as GET + Upgrade. Policies
+    // must receive the actual WebTransport operation, including over gRPC.
+    const auto original_method = http->headers().find("x-original-method");
+    if (original_method != http->headers().end() && !original_method->second.empty()) {
+      const std::string method = original_method->second;
+      http->set_method(method);
+      (*http->mutable_headers())[":method"] = method;
+    }
     http->set_host(resource);
     (*http->mutable_headers())[":authority"] = resource;
     (*http->mutable_headers())["x-original-host"] = resource;

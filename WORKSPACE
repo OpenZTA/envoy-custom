@@ -58,6 +58,7 @@ http_archive(
         "//patches/envoy:0009-connect-udp-packet-semantics.patch",
         "//patches/envoy:0010-quic-p384-server-certificates.patch",
         "//patches/envoy:0011-websocket-extended-connect-upgrade.patch",
+        "//patches/envoy:0012-webtransport.patch",
         "//patches/envoy:tmp-transport-socket-options.patch",
     ],
     sha256 = "e7a78d888a8ce8a380a7608bfe3f805b49de74421ba062e44d22e38f1cffc24b",
